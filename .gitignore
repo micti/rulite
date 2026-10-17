@@ -1,0 +1,32 @@
+# Rust build output
+/target
+**/*.rs.bk
+*.pdb
+
+# cargo-fuzz (seeds/ stays tracked)
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+
+# SQLite databases (rebuilt from sample/*.sql)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Node (supabase-js integration tests)
+node_modules/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local env
+.env
+.env.*

@@ -1,0 +1,32 @@
+[package]
+name = "rulite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Supabase/PostgREST-compatible REST API over any SQLite file"
+license = "MIT"
+repository = "https://github.com/micti/rulite"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bcrypt = "0.19.3"
+getrandom = "0.4.3"
+hmac = "0.13.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", default-features = false, features = ["std"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.53.3", features = ["rt", "net", "macros", "sync", "signal"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+result_large_err = "allow"
