@@ -162,6 +162,22 @@ impl Table {
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
+
+    /// `INTEGER PRIMARY KEY` on a rowid table: an alias of the rowid, filled in by SQLite.
+    pub fn is_rowid_alias(&self, c: &Column) -> bool {
+        !self.without_rowid && self.primary_key.len() == 1 && c.pk == 1 && c.decl_type.eq_ignore_ascii_case("INTEGER")
+    }
+
+    /// Whether `c` can hold NULL. Primary keys of STRICT and WITHOUT ROWID
+    /// tables are NOT NULL even when not declared so, as is the rowid.
+    pub fn nullable(&self, c: &Column) -> bool {
+        !c.not_null && !(c.pk > 0 && (self.strict || self.without_rowid || self.is_rowid_alias(c)))
+    }
+
+    /// Whether an insert must give `c`: not nullable, no default, not the rowid.
+    pub fn required(&self, c: &Column) -> bool {
+        !self.nullable(c) && c.default.is_none() && !self.is_rowid_alias(c)
+    }
 }
 
 impl Relationship {

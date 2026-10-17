@@ -110,7 +110,7 @@ fn table_schema(t: &Table) -> Value {
         if !c.decl_type.is_empty() {
             p.insert("format".into(), c.decl_type.to_ascii_lowercase().into());
         }
-        if !c.not_null {
+        if t.nullable(c) {
             p.insert("nullable".into(), true.into());
         }
         if let Some(d) = &c.default {
@@ -129,7 +129,7 @@ fn table_schema(t: &Table) -> Value {
             p.insert("description".into(), format!("Note:\n{}", notes.join("\n")).into());
         }
         properties.insert(c.name.clone(), p.into());
-        if c.not_null && c.default.is_none() && !is_rowid_alias(t, c) {
+        if t.required(c) {
             required.push(c.name.clone());
         }
     }
@@ -153,11 +153,6 @@ fn json_type(c: &Column) -> Option<&'static str> {
         // BLOBs are read and written as `\x` hex strings.
         Affinity::Text | Affinity::Blob => "string",
     })
-}
-
-/// `INTEGER PRIMARY KEY` on a rowid table: SQLite fills it in.
-fn is_rowid_alias(t: &Table, c: &Column) -> bool {
-    !t.without_rowid && t.primary_key.len() == 1 && c.pk == 1 && c.decl_type.eq_ignore_ascii_case("INTEGER")
 }
 
 fn param_ref(name: &str) -> Value {

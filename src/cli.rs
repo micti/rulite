@@ -1,5 +1,5 @@
-//! `rulite user add|passwd|delete|list` and `rulite keys`: one-shot commands
-//! that work while the server runs (`busy_timeout`).
+//! `rulite user add|passwd|delete|list`, `rulite keys` and `rulite gen types`:
+//! one-shot commands that work while the server runs (`busy_timeout`).
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -11,6 +11,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use crate::auth;
 use crate::config::{Auth, UserAction};
 use crate::jwt::{self, Key};
+use crate::{schema, typescript};
 
 /// Prints the anon and service_role keys, one `role key` per line.
 pub fn keys(auth: &Auth) -> Result<(), String> {
@@ -18,6 +19,18 @@ pub fn keys(auth: &Auth) -> Result<(), String> {
     let now = jwt::now();
     println!("anon          {}", jwt::api_key(&key, "anon", now));
     println!("service_role  {}", jwt::api_key(&key, "service_role", now));
+    Ok(())
+}
+
+/// Prints the TypeScript types of the database, read from a read-only connection.
+pub fn gen_types(db_path: &Path) -> Result<(), String> {
+    let schema = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|c| {
+            c.busy_timeout(Duration::from_secs(5))?;
+            schema::introspect(&c)
+        })
+        .map_err(|e| format!("cannot read {}: {e}", db_path.display()))?;
+    print!("{}", typescript::generate(&schema));
     Ok(())
 }
 
