@@ -1,13 +1,14 @@
-# Rulite — Architecture (end of phase 2)
+# Rulite — Architecture (end of phase 3)
 
-Recap of what phase 1 (M0–M6) and phase 2 (M7–M12 in [PLAN.md](PLAN.md):
-auth, roles, table permissions, owner rows) built, how it fits together, and the rules to keep when
-extending it. Audience: developers and AI coding agents. User-facing auth behaviour: [AUTH.md](AUTH.md).
+Recap of what phase 1 (M0–M6), phase 2 (M7–M12: auth, roles, table permissions, owner rows) and
+phase 3 (M13–M19: auth always on, TypeScript types, CORS, TLS) in [PLAN.md](PLAN.md) built, how it fits
+together, and the rules to keep when extending it. Audience: developers and AI coding agents. User-facing auth behaviour: [AUTH.md](AUTH.md).
 
 Rulite serves a PostgREST/Supabase-compatible REST API (`/rest/v1/{table}`) generated from any
 SQLite file, so `@supabase/supabase-js` works against it unchanged. The guiding constraint is the
-[Design rule](README.md#design-rule): **minimal resource footprint**. Measured: 2.9 MB binary, 3.9 MB idle
-RSS, ~13k req/s on a 5-level nested query, with or without a JWT per request (see [README › Budget](README.md#budget)).
+[Design rule](README.md#design-rule): **minimal resource footprint**. Measured: 3.0 MB binary (3.8 MB with
+`--features tls`), 4.2 MB idle RSS, ~13k req/s on a 5-level nested query with a JWT per request (see
+[README › Budget](README.md#budget)).
 
 ## 1. Tech stack
 
@@ -19,9 +20,11 @@ RSS, ~13k req/s on a 5-level nested query, with or without a JWT per request (se
 | Database | `rusqlite` 0.40 with `bundled` SQLite | One connection per DB thread, no pool |
 | JSON | Built **inside SQLite** (`json_object`, `json_group_array`, `json_each`, `->>`) | `serde_json` only for error bodies, OpenAPI and scanning write-body keys |
 | Config | Hand-rolled CLI/env parser + JSON config file validated by hand (`src/config.rs`) | No config/clap crate, no serde derive |
-| Auth crypto | `hmac` + `sha2` (HS256, written by hand), `bcrypt` (cost 10), `getrandom` | No `jsonwebtoken`/`ring`; base64url hand-written |
+| Auth crypto | `hmac` + `sha2` (HS256, written by hand), `bcrypt` (cost 10), `getrandom` | No `jsonwebtoken`; base64url hand-written |
+| CORS | `axum::middleware::from_fn_with_state` layer (`src/cors.rs`) | No `tower-http` |
+| TLS (optional) | Cargo feature `tls`: `rustls` (`ring` provider, TLS 1.2 + 1.3), `tokio-rustls`, `rustls-pki-types` PEM; adds `tokio/time` | Off by default; the default build has none of these crates |
 | Release profile | `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true` | |
-| Integration tests | Node ≥ 22.13, `node:test`, `@supabase/supabase-js`, `node:sqlite` | `tests/` |
+| Integration tests | Node ≥ 22.13, `node:test`, `@supabase/supabase-js`, `node:sqlite`, `typescript` (dev, `tsc --noEmit`) | `tests/` |
 | Fuzzing | `cargo-fuzz` (nightly), libFuzzer | `fuzz/` |
 | Benchmark | `oha` via `tests/bench.sh` | |
 
@@ -29,12 +32,14 @@ RSS, ~13k req/s on a 5-level nested query, with or without a JWT per request (se
 
 ```
 src/
-  main.rs      entry: Command → serve (db::open → current_thread runtime → server::run) | user | keys
-  config.rs    subcommands; CLI args > env vars (RULITE_*) > JSON config file > defaults; validation
+  main.rs      entry: Command → serve (auth tables → db::open → current_thread runtime → server::run)
+               | user | keys | gen types
+  config.rs    subcommands; CLI args > env vars (RULITE_*) > JSON config file > defaults; validation;
+               serving needs a jwt_secret; CORS origins and TLS paths (relative to the config file)
   access.rs    config `tables` → one Policy per role (anon, authenticated); warnings vs. the schema
   jwt.rs       HS256 sign/verify, base64url, API keys, refresh tokens, UUIDs
   auth.rs      auth_* tables, sessions + refresh rotation, /auth/v1 routes, Role from headers → Grant
-  cli.rs       `rulite user add|passwd|delete|list`, `rulite keys`
+  cli.rs       `rulite user add|passwd|delete|list`, `rulite keys`, `rulite gen types` (read-only connection)
   db.rs        DB threads (1 writer + 1–2 readers), job channels, Db::read / Db::write
   schema.rs    introspection → Schema (tables, columns, uniques, FKs, relationships); SchemaCache
   query.rs     PURE parser: query string + Prefer/Range/Accept headers → Query AST, Headers
@@ -42,13 +47,18 @@ src/
                Grant / Policy / Rule / Perm (plain data, so the fuzz crate can build it)
   write.rs     write SQL builder + executor: INSERT / upsert / UPDATE / DELETE in one transaction
   openapi.rs   OpenAPI 3 document from Schema (hand-written serde_json)
+  typescript.rs  `supabase gen types typescript` output from Schema (fmt::Write)
+  cors.rs      CORS middleware; the header logic is a pure function (`decide`)
+  tls.rs       (feature `tls`) PEM loading → rustls ServerConfig; TlsListener for axum::serve
   server.rs    axum routes, header parsing, status codes, PostgREST error mapping, shutdown
-tests/         Node integration suite (run.mjs, client.mjs, read.test.mjs, write.test.mjs, bench.sh)
+tests/         Node integration suite (run.mjs, server.mjs, client.mjs, *.test.mjs, types/usage.ts,
+               tls/ test certificate, bench.sh)
 fuzz/          fuzz targets `parse` and `build_read`, seeds, dictionary
-sample/        novel.sql / event.sql / todo.sql (dev schemas), todo.json (auth config), built .db files
+sample/        novel / event / todo: .sql (dev schemas), .json (configs, one jwt_secret),
+               .types.ts (golden TypeScript types), built .db files
 ```
 
-Approximate size: ~6.2k lines of Rust (incl. 98 unit tests), ~1.1k lines of JS tests (94 cases).
+Approximate size: ~7.7k lines of Rust (incl. 115 unit tests, 113 without `tls`), ~1.5k lines of JS / TS tests (115 cases).
 
 ## 3. Runtime architecture
 
@@ -88,12 +98,19 @@ Key points:
 
 ## 4. Request lifecycle
 
-### Role — every `/rest/v1` request (auth on)
+### CORS — before routing (with `--cors-origins`)
+
+`cors::layer` wraps the whole router (fallback included). `cors::decide(origins, method, headers)`
+returns `Pass` (no `Origin`, or not allowed: the request goes on unchanged), `Preflight(headers)`
+(`OPTIONS` + `Access-Control-Request-Method`: answered `204` before routing and auth) or
+`Response(headers)` (added to whatever the handler answers, errors included).
+
+### Role — every `/rest/v1` request
 
 `Caller::of` (server.rs) takes the token from `Authorization: Bearer`, else `apikey`, and
 `Auth::role` verifies it → `Role::{Anon, Authenticated(uid), Service}` or `401 PGRST302/301/303`.
 `Auth::grant` turns the role into a `Grant { policy: Option<Arc<Policy>>, uid }` that moves into the
-DB job. `service_role` and auth off get `Grant::default()` (no policy: nothing is checked).
+DB job. `service_role` gets `Grant::default()` (no policy: nothing is checked).
 
 ### Read — `GET /rest/v1/{table}`
 
@@ -136,7 +153,7 @@ DB job. `service_role` and auth off get `Grant::default()` (no policy: nothing i
 5. Build errors and single-object mismatches roll the transaction back.
    Status: insert `201`, others `200` with body or `204` without.
 
-### Auth — `/auth/v1` (auth on only)
+### Auth — `/auth/v1`
 
 Every route first checks that `apikey` is a valid anon / service_role key. Sign-in reads the user on a
 reader, runs bcrypt off-thread (an unknown email is checked against a dummy hash), then creates the
@@ -201,15 +218,16 @@ and logout are writer transactions too. Access-token claims and the user object 
   on the `authenticated` policy. Refused at startup: unknown fields / values, `owner` on `"*"`,
   `owner_scope` without `owner`, `anon: "write"` on an owner table, a secret under 32 bytes.
   `Auth::check_schema` logs unknown tables / owner columns once per schema version.
-- Tables are created with `CREATE TABLE IF NOT EXISTS` at server start (auth on) or by `rulite user`.
+- Tables are created with `CREATE TABLE IF NOT EXISTS` at server start or by `rulite user`.
   Refresh tokens rotate (`parent` = old token, old one `revoked = 1`); a revoked token inside
   `refresh_token_reuse_interval` returns the session's newest active token, later it deletes the session.
 - JWT: only `alg = HS256`, MAC compared in constant time (`verify_slice`), `exp` with 30 s leeway.
 
 ### server.rs — HTTP & errors
 
-Routes: `GET /rest/v1[/]` → OpenAPI (`service_role` only when auth is on); `GET|POST|PATCH|DELETE
-/rest/v1/{table}`; with auth on, `/auth/v1/*` (auth.rs); anything else → `404 PGRST125`.
+Routes: `GET /rest/v1[/]` → OpenAPI; `GET /pg/generators/typescript` → TypeScript types (the postgres-meta
+route); `GET|POST|PATCH|DELETE /rest/v1/{table}`; `/auth/v1/*` (auth.rs); anything else → `404 PGRST125`.
+Both schema documents go through `schema_document`: `service_role` only, built on a reader and cached.
 Error body is always PostgREST's `{code, message, details, hint}`.
 
 | Source | HTTP | `code` |
@@ -228,15 +246,27 @@ Error body is always PostgREST's `{code, message, details, hint}`.
 | FK violation | 409 | `23503` |
 | NOT NULL / CHECK / STRICT type | 400 | `23502` / `23514` / `22P02` |
 | Busy / locked | 503 | `55P03` |
-| No key / bad token / expired token (auth on) | 401 | `PGRST302` / `PGRST301` / `PGRST303` |
+| No key / bad token / expired token | 401 | `PGRST302` / `PGRST301` / `PGRST303` |
 | Role lacks the permission; owner set to another user | 401 (anon) / 403 | `42501` |
 | DB thread gone | 503 | `PGRST000` |
 | Anything else | 500 | `XX000` |
 
-### openapi.rs
+### openapi.rs / typescript.rs
 
-Built on demand from the `Schema`, cached in `App.openapi` as `(schema_version, Bytes)` and rebuilt
-only when the version moves.
+Built on demand from the `Schema`, cached in `App.openapi` / `App.typescript` as `(schema_version, Bytes)`
+and rebuilt only when the version moves. Both share `Table::nullable` / `Table::required` (schema.rs): a
+STRICT or WITHOUT ROWID primary key and the rowid alias are never null; a column is required on insert when
+not nullable, without default and not the rowid alias. `typescript.rs` follows the Supabase CLI layout
+(tables and columns sorted by name, one `Relationships` entry per FK named `<table>_<cols>_fkey`,
+`isOneToOne` when the FK columns are a unique key, the CLI's helper types verbatim); `sample/*.types.ts`
+are golden files checked by `cargo test` (`RULITE_BLESS=1` rewrites them).
+
+### tls.rs (feature `tls`)
+
+`server_config` loads the cert chain and the key (PKCS#8 / SEC1 / RSA) and checks they match; ALPN
+`http/1.1`. `TlsListener` implements `axum::serve::Listener`: a task accepts TCP connections, each
+handshake runs in its own task (10 s timeout, failure logged, connection dropped) and finished streams
+reach `accept()` through a bounded channel. Routes and graceful shutdown are unchanged.
 
 ## 6. Invariants — do not break these
 
@@ -257,16 +287,19 @@ only when the version moves.
    and verified by a Node test through the real client.
 10. **Access is checked in the builders, from a `Grant`.** Every table a statement touches goes through
     `Grant::owner` / `Builder::access`; the uid is a bound parameter; no SQL text comes from the config
-    (owner columns are emitted with the schema's name). Without a JWT secret, behaviour is phase 1's.
+    (owner columns are emitted with the schema's name). Auth is always on: no server runs without a
+    JWT secret, and a table nobody granted is closed to `anon` and `authenticated`.
+11. **The default build stays lean.** TLS crates live behind the `tls` feature only; check binary size
+    with and without it (`tests/bench.sh`).
 
 ## 7. Testing & tooling
 
 | Layer | Command | What it covers |
 |---|---|---|
-| Unit (Rust) | `cargo test` | 98 tests: config, parser, SQL builder, grants / owner rows, writes, schema/relationships, JWT, sessions / refresh, error mapping, status codes |
-| Integration | `cargo build --release && cd tests && npm install && npm test` | `run.mjs` rebuilds `novel.db`/`event.db`/`todo.db` from `.sql` in a temp dir, adds users with `rulite user add`, starts one release binary per DB on a free port (`todo.db` with auth), runs `*.test.mjs` |
+| Unit (Rust) | `cargo test` (`--features tls` adds PEM loading) | config (CORS / TLS options too), parser, SQL builder, grants / owner rows, writes, schema/relationships, JWT, sessions / refresh, error mapping, status codes, TypeScript types (+ golden files), CORS headers |
+| Integration | `cargo build --release && cd tests && npm install && npm test` | `run.mjs` rebuilds `novel.db`/`event.db`/`todo.db` from `.sql` in a temp dir, adds users with `rulite user add`, starts one release binary per DB on a free port with its `sample/<name>.json` (novel with `--cors-origins`), runs `*.test.mjs`; `types.test.mjs` runs `tsc --noEmit` on `tests/types/usage.ts`; `tls.test.mjs` needs `cargo build --release --features tls --target-dir target/tls` (skipped otherwise) |
 | Fuzz | `cd fuzz && cargo +nightly fuzz run -a parse ...` / `build_read ...` | Parser never panics; built SQL only names schema identifiers under random grants, binds the uid, and SQLite prepares it |
-| Budget | `tests/bench.sh [seconds] [readers] [auth]` | Binary size, idle/peak RSS, req/s, p50/p99 with `oha`; `auth` adds a JWT per request |
+| Budget | `tests/bench.sh [seconds] [readers] [auth\|tls]` | Binary size (with and without `tls`), idle/peak RSS, req/s, p50/p99 with `oha`; anon key per request, `auth` a user token, `tls` over HTTPS |
 
 Sample schemas cover the relationship cases: `novel.db` is a 5-level one-to-many chain;
 `event.db` has a self reference (`area.parent_id`), two tables referencing `area`, a many-to-many
@@ -275,7 +308,7 @@ Sample schemas cover the relationship cases: `novel.db` is a 5-level one-to-many
 Adding a feature: unit-test the parser/builder in the module's `mod tests`, add a supabase-js case
 in `tests/*.test.mjs`, add fuzz seeds/dict tokens if new syntax, re-run the bench if it touches the hot path.
 
-## 8. Known gaps & phase 2 candidates
+## 8. Known gaps & candidates
 
 Out of scope so far (PLAN): realtime (`update_hook`, planned behind an off-by-default Cargo
 feature), RPC / views-as-functions, storage, admin UI, multi-database; for auth: sign-up, magic link,
@@ -284,8 +317,8 @@ OTP, OAuth, MFA, policy SQL, column grants, asymmetric keys, config hot reload.
 Gaps noticed in the current code:
 
 - **Views** are not introspected (open question in PLAN: expose read-only?).
-- **Auth is off without a JWT secret:** then any `apikey` / `Authorization` is accepted; bind defaults
-  to `127.0.0.1:3000`. No CORS headers yet (browsers on another origin need a proxy).
+- Bind defaults to `127.0.0.1:3000`; a non-loopback bind without TLS logs a warning to put an HTTPS proxy
+  in front. Built-in TLS has no certificate reload (restart after renewal), no ACME, no HTTP/2.
 - `count=planned|estimated` = exact; `return=headers-only` behaves like `minimal`.
 - No request body size limit beyond axum's default; no request timeout.
 - Statement cache capacity is rusqlite's default (16) — may thrash with many query shapes.

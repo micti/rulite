@@ -4,7 +4,8 @@ Supabase-style auth for a dev/test server: supabase-js signs in with email + pas
 `/rest/v1` request runs as one of three roles. Each table grants each role `none`, `read` or `write`,
 and can limit logged-in users to their own rows through an owner column.
 
-Auth is **off** until a JWT secret is configured; then every request needs a key.
+Auth is always on: `rulite <db>` needs a JWT secret to start, every request needs a key, and `anon` and
+`authenticated` see only the tables the config grants them.
 
 ## Quick start
 
@@ -45,8 +46,9 @@ const { data } = await supabase.from('todo').select('*')   // only alice's todos
 | `authenticated` | the user's access token after sign-in | signed-in users | what the table grants `authenticated`, own rows only on owner tables |
 | `service_role` | the **service_role key** (private, server side only) | seed scripts, admin jobs, tests | every table, every row, no checks |
 
-The OpenAPI document (`GET /rest/v1/`) is served to `service_role` only; `anon` and `authenticated`
-get `42501`. With auth off it stays open, as in phase 1.
+The OpenAPI document (`GET /rest/v1/`) and the TypeScript types (`GET /pg/generators/typescript`, see
+[README](README.md#typescript-types)) reveal the whole schema, so they are served to `service_role` only; `anon`
+gets `401` and `authenticated` `403`, both with code `42501`.
 
 `rulite keys` prints both keys. Like Supabase's (legacy) API keys they are HS256 JWTs signed with `jwt_secret`,
 with claims `{"iss": "supabase", "ref": "rulite", "role": "anon" | "service_role", "iat", "exp"}` and valid
@@ -71,7 +73,7 @@ terminal; piped, `user delete` doesn't ask). Pass `--config` so `user add` / `pa
 
 Users live in the same database file, in `auth_users` (plus `auth_sessions`, `auth_refresh_tokens`), with
 the same columns as GoTrue's `auth.users`, `auth.sessions`, `auth.refresh_tokens` (a subset). These
-tables are created on first use and are not exposed by `/rest/v1`. A user's `id` is a UUID string, so
+tables are created at server start (or by the first `rulite user` command) and are not exposed by `/rest/v1`. A user's `id` is a UUID string, so
 app tables can reference it: `user_id TEXT REFERENCES auth_users(id) ON DELETE CASCADE`.
 
 ## Client auth API
@@ -127,7 +129,8 @@ A signed-out session's access token stays valid until it expires (`jwt_exp`, def
 ## Config file
 
 `rulite <db> --config rulite.json` (or `RULITE_CONFIG`). CLI flags and env vars override the file;
-`RULITE_JWT_SECRET` overrides `jwt_secret`, so the secret can stay out of the file.
+`RULITE_JWT_SECRET` overrides `jwt_secret`, so the secret can stay out of the file. Without a config,
+`RULITE_JWT_SECRET` alone starts a server where only the `service_role` key works.
 
 ```json
 {
@@ -147,12 +150,14 @@ A signed-out session's access token stays valid until it expires (`jwt_exp`, def
 
 | Key | Default | Meaning |
 |---|---|---|
-| `jwt_secret` | — | HS256 secret, at least 32 characters. Without it auth is off. |
+| `jwt_secret` | — | HS256 secret, at least 32 characters. Required: the server refuses to start without it. |
 | `jwt_exp` | `3600` | Access token lifetime in seconds. |
 | `external_url` | `http://<bind>` | Public base URL; the token `iss` is `<external_url>/auth/v1` (Supabase's `API_EXTERNAL_URL`). |
 | `refresh_token_reuse_interval` | `10` | Seconds an already-used refresh token is still accepted (parallel tabs refreshing at once). |
 | `password_min_length` | `6` | Applies to `user add`, `user passwd` and `updateUser({ password })`. |
-| `tables` | `{}` | Permissions per table, see below. |
+| `tables` | `{}` | Permissions per table, see below. Without any grant only `service_role` works (logged at startup). |
+| `cors_origins` | none | Origins a browser app may call from: `["http://localhost:5173", …]` or `"*"` (`--cors-origins`, `RULITE_CORS_ORIGINS`). See [README › Deploy](README.md#deploy). |
+| `tls_cert`, `tls_key` | none | PEM certificate chain and private key for built-in HTTPS, relative to the config file (`--tls-cert` / `--tls-key`, `RULITE_TLS_CERT` / `RULITE_TLS_KEY`). Needs a build with `--features tls`. |
 
 ## Table permissions
 
@@ -219,7 +224,7 @@ REST errors use PostgREST's `{code, message, details, hint}`; auth errors use Go
 | No key or token (`/rest/v1`) | 401 | `PGRST302` |
 | Malformed token or bad signature | 401 | `PGRST301` |
 | Expired token | 401 | `PGRST303` |
-| Role lacks the permission (anon / authenticated), incl. OpenAPI | 401 / 403 | `42501` |
+| Role lacks the permission (anon / authenticated), incl. OpenAPI and types | 401 / 403 | `42501` |
 | Owner column set to another user | 403 | `42501` |
 | Wrong email or password | 400 | `invalid_credentials` |
 | Unknown, used or revoked refresh token | 400 | `refresh_token_not_found` / `refresh_token_already_used` |
@@ -232,4 +237,5 @@ REST errors use PostgREST's `{code, message, details, hint}`; auth errors use Go
 - One HS256 secret; no asymmetric keys, no key rotation without signing everyone out.
 - Permissions are per table and role, not per column. The only row rule is the owner column.
 - Config is read at startup; restart after changing it.
-- Built for development and testing. Put it behind HTTPS (e.g. Caddy) before exposing it on a VPS.
+- Built for development and testing. Put it behind an HTTPS proxy (Caddy, see [README › Deploy](README.md#deploy))
+  before exposing it on a VPS; built-in TLS (`--features tls`) works but is not the recommended setup.

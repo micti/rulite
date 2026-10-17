@@ -41,13 +41,23 @@ GET    /rest/v1/                           -> OpenAPI document
 - [x] **M11 Owner rows:** an owner column limits each user to their own rows.
 - [x] **M12 Quality:** `sample/todo.db`, auth and access tests, fuzzing with grants, benchmark with auth.
 
-Without a JWT secret, Rulite behaves exactly as in phase 1.
+## Phase 3 — Auth always on, TypeScript types & web server (done)
+
+- [x] **M13 Auth always on:** no server without a `jwt_secret`;
+- [x] **M14 Type generator:** `supabase gen types typescript` output from the schema (`Row`, `Insert`, `Update`,
+  `Relationships`), so `createClient<Database>()` type-checks `from()`, `select()`, `insert()`, `update()`.
+- [x] **M15 Type export:** `GET /pg/generators/typescript` (`service_role` only, like OpenAPI) and
+  `rulite gen types <db>`.
+- [x] **M16 Quality:** golden `sample/*.types.ts`, access tests, `tsc --noEmit` on `tests/types/usage.ts`.
+- [x] **M17 CORS:** `--cors-origins` / `cors_origins`; preflight answered before routing and auth.
+- [x] **M18 TLS:** opt-in Cargo feature `tls` (rustls + `ring`), `--tls-cert` / `--tls-key`; a reverse proxy
+  (Caddy) stays the recommended setup, and the default build does not grow.
+- [x] **M19 Quality:** CORS / TLS unit tests, `cors.test.mjs`, `tls.test.mjs` with a self-signed test cert,
+  bench with and without `tls`, README "Deploy".
 
 ## Not planned yet
 
 - Realtime (`update_hook`), RPC, storage, admin UI, multiple databases.
 - Auth: sign-up, magic link, OTP, OAuth, MFA, policy SQL, column grants, asymmetric keys.
-
-## Open questions
-
-- Views: expose them as read-only resources?
+- Types: `CHECK (col IN (…))` as a string-literal union (Supabase only does that for real enums).
+- TLS: ACME / Let's Encrypt, certificate reload, HTTP/2, client certificates (use a proxy).
