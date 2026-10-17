@@ -1,0 +1,10 @@
+{
+  "jwt_secret": "rulite-dev-secret-not-for-production-0123456789",
+  "refresh_token_reuse_interval": 2,
+  "tables": {
+    "tag":     { "anon": "read", "authenticated": "read" },
+    "list":    { "authenticated": "write", "owner": "owner_id" },
+    "todo":    { "authenticated": "write", "owner": "user_id" },
+    "comment": { "anon": "read", "authenticated": "write", "owner": "author_id", "owner_scope": "write" }
+  }
+}
