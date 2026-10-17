@@ -1,0 +1,1 @@
+Inot.or=(genre.eq.fantasy,and(status.eq.hiatus,author.like.Lin*))&title=in.(a,"b,c")&genre=not.is.null

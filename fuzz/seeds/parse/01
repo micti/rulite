@@ -1,0 +1,4 @@
+select=title,edition(language,volume(number,chapter(title,part(content))))&edition.order=language&edition.volume.limit=1
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

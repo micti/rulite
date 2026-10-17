@@ -1,0 +1,4 @@
+select=name,sub_event(title,event(name))&country=eq.VN&genres=ilike.*pop*
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

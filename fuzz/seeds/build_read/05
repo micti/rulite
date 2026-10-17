@@ -1,0 +1,1 @@
+nselect=name,area(name,parent:area!parent_id(name)),sub_event(title,area(name),artist(name))

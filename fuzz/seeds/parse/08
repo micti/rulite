@@ -1,0 +1,4 @@
+select=t:title,edition!inner(language)&edition.language=eq.vi
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

@@ -1,0 +1,1 @@
+Zselect=content,chapter(title,volume(title))&word_count=gte.8

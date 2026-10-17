@@ -1,0 +1,4 @@
+select=*,lineup(*)&price=lt.20&order=price.desc.nullsfirst,title
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

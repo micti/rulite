@@ -1,0 +1,1 @@
+Aselect=name,sub_event(title,event(name))&country=eq.VN&genres=ilike.*pop*

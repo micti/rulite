@@ -1,0 +1,13 @@
+{
+  "name": "rulite-tests",
+  "private": true,
+  "type": "module",
+  "description": "Integration tests: Rulite through @supabase/supabase-js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning run.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0"
+  }
+}

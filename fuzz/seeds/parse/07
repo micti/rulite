@@ -1,0 +1,4 @@
+select=name,children:area!parent_id!many(name,capacity)&kind=eq.venue&children.order=capacity.desc.nullslast
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

@@ -1,0 +1,4 @@
+select=content,chapter(title,volume(title))&word_count=gte.8
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

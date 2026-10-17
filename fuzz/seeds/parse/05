@@ -1,0 +1,4 @@
+select=name,area(name,parent:area!parent_id(name)),sub_event(title,area(name),artist(name))
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json

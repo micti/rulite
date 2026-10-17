@@ -1,0 +1,4 @@
+not.or=(genre.eq.fantasy,and(status.eq.hiatus,author.like.Lin*))&title=in.(a,"b,c")&genre=not.is.null
+return=representation,count=exact
+0-9
+application/vnd.pgrst.object+json
