@@ -9,15 +9,16 @@ permissions:
 
 jobs:
   build:
+    name: build ${{ matrix.platform.target }} (${{ matrix.variant }})
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-14, target: aarch64-apple-darwin }
         variant: [default, tls]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Check tag matches Cargo.toml version
@@ -27,29 +28,29 @@ jobs:
           [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.platform.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ matrix.variant }}
+          key: ${{ matrix.platform.target }}-${{ matrix.variant }}
       - name: Build
         shell: bash
         run: |
           features=""
           [ "${{ matrix.variant }}" = tls ] && features="--features tls"
-          cargo build --release --locked --target ${{ matrix.target }} $features
+          cargo build --release --locked --target ${{ matrix.platform.target }} $features
       - name: Package
         shell: bash
         run: |
           suffix=""
           [ "${{ matrix.variant }}" = tls ] && suffix="-tls"
-          name="rulite-${{ matrix.target }}$suffix"
+          name="rulite-${{ matrix.platform.target }}$suffix"
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/rulite README.md LICENSE "$name/"
+          cp target/${{ matrix.platform.target }}/release/rulite README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-${{ matrix.variant }}
+          name: ${{ matrix.platform.target }}-${{ matrix.variant }}
           path: rulite-*.tar.gz*
 
   release:
