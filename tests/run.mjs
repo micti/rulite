@@ -2,8 +2,9 @@
 //   1. rebuild temp copies of sample/novel.db, event.db and todo.db from their .sql files
 //   2. add the users alice, bob and carol to todo.db with `rulite user add` (piped answers)
 //      and read the API keys from `rulite keys`
-//   3. start one target/release/rulite per database on a free port; todo.db with
-//      `--config sample/todo.json` (auth on), the others without auth
+//   3. start one target/release/rulite per database on a free port, each with its
+//      sample/<name>.json config (one jwt_secret, so one key pair works on all three);
+//      novel also allows the CORS origins in CORS_ORIGINS
 //   4. run every *.test.mjs with `node --test`, one file at a time (they share the databases)
 //   5. stop the servers and remove the temp copies
 //
@@ -12,13 +13,13 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 
+import { bin, root, serverEnv, start } from './server.mjs'
+
 const here = dirname(fileURLToPath(import.meta.url))
-const root = resolve(here, '..')
-const bin = process.env.RULITE_BIN ?? join(root, 'target/release/rulite')
 
 if (!existsSync(bin)) {
   console.error(`rulite binary not found at ${bin}; run \`cargo build --release\` first`)
@@ -36,30 +37,17 @@ function buildDb(name) {
   return path
 }
 
-// The servers get no auth settings from the caller's environment.
-const serverEnv = { ...process.env }
-delete serverEnv.RULITE_CONFIG
-delete serverEnv.RULITE_JWT_SECRET
-
 function rulite(args, input) {
-  return execFileSync(bin, args, { input, encoding: 'utf8', env: serverEnv })
+  return execFileSync(bin, args, { input, encoding: 'utf8', env: serverEnv() })
 }
 
-// Binds port 0 and reads the real address from rulite's "serving ... on http://..." line.
-function start(name, dbPath, extra = []) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(bin, [dbPath, '--bind', '127.0.0.1:0', ...extra], { stdio: ['ignore', 'inherit', 'pipe'], env: serverEnv })
-    servers.push(child)
-    let log = ''
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk) => {
-      log += chunk
-      const m = log.match(/ on (http:\/\/\S+)\n/)
-      if (m) resolve(m[1])
-    })
-    child.on('exit', (code) => reject(new Error(`rulite (${name}) exited with ${code}:\n${log}`)))
-    child.on('error', reject)
-  })
+const config = (name) => join(root, 'sample', `${name}.json`)
+const CORS_ORIGINS = 'http://localhost:5173,https://app.example.com'
+
+async function serve(name, dbPath = buildDb(name), extra = []) {
+  const { url, child } = await start([dbPath, '--config', config(name), ...extra])
+  servers.push(child)
+  return url
 }
 
 function stop() {
@@ -76,26 +64,27 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 
 let status = 1
 try {
-  const config = join(root, 'sample/todo.json')
   const todoDb = buildDb('todo')
   for (const user of ['alice', 'bob', 'carol']) {
-    rulite(['user', 'add', todoDb, '--config', config], `${user}@example.com\nsecret1\nsecret1\n`)
+    rulite(['user', 'add', todoDb, '--config', config('todo')], `${user}@example.com\nsecret1\nsecret1\n`)
   }
-  const keys = Object.fromEntries(rulite(['keys', '--config', config]).trim().split('\n').map((l) => l.split(/\s+/)))
+  const keys = Object.fromEntries(rulite(['keys', '--config', config('todo')]).trim().split('\n').map((l) => l.split(/\s+/)))
   const [novelUrl, eventUrl, todoUrl] = await Promise.all([
-    start('novel', buildDb('novel')),
-    start('event', buildDb('event')),
-    start('todo', todoDb, ['--config', config]),
+    serve('novel', undefined, ['--cors-origins', CORS_ORIGINS]),
+    serve('event'),
+    serve('todo', todoDb),
   ])
   const files = readdirSync(here).filter((f) => f.endsWith('.test.mjs')).sort()
   const args = ['--test', '--test-concurrency=1', ...process.argv.slice(2), ...files]
   const env = {
     ...process.env,
+    RULITE_BIN: bin,
     RULITE_URL: novelUrl,
     RULITE_NOVEL_URL: novelUrl,
     RULITE_EVENT_URL: eventUrl,
     RULITE_TODO_URL: todoUrl,
-    RULITE_TODO_CONFIG: config,
+    RULITE_TODO_CONFIG: config('todo'),
+    RULITE_CORS_ORIGINS: CORS_ORIGINS,
     RULITE_ANON_KEY: keys.anon,
     RULITE_SERVICE_KEY: keys.service_role,
   }

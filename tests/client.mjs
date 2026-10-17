@@ -2,16 +2,19 @@ import { createHmac } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createClient } from '@supabase/supabase-js'
 
-// novel and event run without auth: any key works.
 const options = { auth: { persistSession: false, autoRefreshToken: false } }
 
-export const novel = createClient(process.env.RULITE_NOVEL_URL, 'dev-key', options)
-export const event = createClient(process.env.RULITE_EVENT_URL, 'dev-key', options)
-
-// todo runs with sample/todo.json: auth on.
-export const todoUrl = process.env.RULITE_TODO_URL
+// Every server has the same jwt_secret, so one anon / service_role key pair works on all three.
 export const anonKey = process.env.RULITE_ANON_KEY
 export const serviceKey = process.env.RULITE_SERVICE_KEY
+
+// novel and event grant anon read + write on every table (sample/novel.json, sample/event.json).
+export const novelUrl = process.env.RULITE_NOVEL_URL
+export const novel = createClient(novelUrl, anonKey, options)
+export const event = createClient(process.env.RULITE_EVENT_URL, anonKey, options)
+
+// todo runs with sample/todo.json: roles, table permissions and owner rows.
+export const todoUrl = process.env.RULITE_TODO_URL
 export const secret = JSON.parse(readFileSync(process.env.RULITE_TODO_CONFIG, 'utf8')).jwt_secret
 
 /** A new client for the todo server; `headers` go on every request. */

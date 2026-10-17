@@ -1,0 +1,6 @@
+{
+  "jwt_secret": "rulite-dev-secret-not-for-production-0123456789",
+  "tables": {
+    "*": { "anon": "write" }
+  }
+}
