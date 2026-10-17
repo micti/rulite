@@ -59,6 +59,13 @@ impl Access {
         Ok(access)
     }
 
+    /// Whether any table is open to anon or authenticated.
+    pub fn granted(&self) -> bool {
+        [&self.anon, &self.authenticated]
+            .iter()
+            .any(|p| p.default.perm != Perm::None || p.tables.iter().any(|(_, r)| r.perm != Perm::None))
+    }
+
     /// Config names the schema doesn't have: unknown tables (they may be
     /// created later) and owner columns (the table is denied until fixed).
     pub fn warnings(&self, schema: &Schema) -> Vec<String> {
@@ -150,6 +157,10 @@ mod tests {
         assert_eq!(r(&a.anon, "comment"), Rule { perm: Perm::Read, owner: None, read_all: false });
         assert!(r(&a.authenticated, "comment").read_all);
         assert_eq!(parse(json!({})).unwrap().authenticated.rule("x").perm, Perm::None);
+        assert!(a.granted());
+        assert!(!parse(json!({})).unwrap().granted());
+        assert!(!parse(json!({ "t": { "anon": "none" } })).unwrap().granted());
+        assert!(parse(json!({ "*": { "anon": "read" } })).unwrap().granted());
     }
 
     #[test]

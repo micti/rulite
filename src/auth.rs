@@ -24,7 +24,7 @@ use crate::schema::Schema;
 use crate::server::App;
 use crate::sql::{Grant, Policy};
 
-/// Created on first use; `schema.rs` keeps them out of `/rest/v1`.
+/// Created at server start or by `rulite user`; `schema.rs` keeps them out of `/rest/v1`.
 pub const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS auth_users (
   id TEXT PRIMARY KEY NOT NULL,
@@ -117,7 +117,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
     bcrypt::verify(password, hash).unwrap_or(false)
 }
 
-/// Auth state for a server with a JWT secret.
+/// Auth state of the server.
 pub struct Auth {
     key: Key,
     /// `<external_url>/auth/v1`.
@@ -443,7 +443,7 @@ fn refresh_not_found() -> Error {
 
 /// Auth state, after checking that `apikey` is a valid anon or service_role key.
 fn api_key(app: &App, headers: &HeaderMap) -> Result<Arc<Auth>, Error> {
-    let auth = app.auth.clone().expect("/auth/v1 is only routed with auth on");
+    let auth = app.auth.clone();
     let Some(key) = headers.get("apikey").and_then(|v| v.to_str().ok()) else {
         return Err(Error::new(StatusCode::UNAUTHORIZED, "no_api_key", "No API key found in request"));
     };

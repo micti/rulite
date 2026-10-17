@@ -1,5 +1,5 @@
-//! HTTP layer: routes under `/rest/v1` (and `/auth/v1` with auth on),
-//! the request's role, PostgREST-shaped errors.
+//! HTTP layer: routes under `/rest/v1` and `/auth/v1`, the request's role,
+//! PostgREST-shaped errors.
 
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +7,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use rusqlite::ErrorCode;
@@ -15,81 +16,97 @@ use tokio::net::TcpListener;
 
 use crate::auth::{self, Auth, Role, RoleError};
 use crate::config::Config;
+use crate::cors;
 use crate::db::{Db, DbError};
 use crate::openapi;
 use crate::query::{self, Headers, ParseError};
 use crate::schema::Schema;
 use crate::sql::{self, BuildError, Grant, Limits, Page};
+use crate::typescript;
 use crate::write::{self, Action, Output, Write};
 
 const JSON: &str = "application/json; charset=utf-8";
 const OBJECT: &str = "application/vnd.pgrst.object+json; charset=utf-8";
 const OPENAPI: &str = "application/openapi+json; charset=utf-8";
+const TYPESCRIPT: &str = "text/plain; charset=utf-8";
+
+/// A document built from the schema and the schema version it was built from.
+type Cache = Arc<Mutex<Option<(i64, Bytes)>>>;
 
 pub struct App {
     pub db: Db,
     limits: Limits,
-    /// The OpenAPI document and the schema version it was built from.
-    openapi: Arc<Mutex<Option<(i64, Bytes)>>>,
-    /// Set when a JWT secret is configured.
-    pub auth: Option<Arc<Auth>>,
+    openapi: Cache,
+    typescript: Cache,
+    pub auth: Arc<Auth>,
 }
 
 pub async fn run(config: &Config, db: Db) -> std::io::Result<()> {
+    #[cfg(feature = "tls")]
+    let tls = match &config.tls {
+        Some(tls) => Some(crate::tls::server_config(&tls.cert, &tls.key).map_err(std::io::Error::other)?),
+        None => None,
+    };
     let limits = Limits { default: config.default_limit, max: config.max_limit };
     let listener = TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
-    let auth = config.auth.jwt_secret.as_deref().map(|secret| {
-        let base = config.auth.external_url.clone().unwrap_or_else(|| format!("http://{addr}"));
-        Arc::new(Auth::new(&config.auth, secret, &base))
-    });
+    let scheme = if config.tls.is_some() { "https" } else { "http" };
+    let secret = config.auth.jwt_secret.as_deref().expect("checked by the config");
+    let base = config.auth.external_url.clone().unwrap_or_else(|| format!("{scheme}://{addr}"));
+    let auth = Arc::new(Auth::new(&config.auth, secret, &base));
+    if !config.auth.access.granted() {
+        eprintln!("rulite: warning: no table is granted to anon or authenticated; only the service_role key works");
+    }
 
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/rest/v1", get(openapi_document))
         .route("/rest/v1/", get(openapi_document))
-        .route("/rest/v1/{table}", get(read_table).post(insert).patch(update).delete(delete));
-    if auth.is_some() {
-        router = router.nest("/auth/v1", auth::routes());
+        .route("/rest/v1/{table}", get(read_table).post(insert).patch(update).delete(delete))
+        .route("/pg/generators/typescript", get(typescript_types))
+        .nest("/auth/v1", auth::routes());
+    let state =
+        Arc::new(App { db, limits, openapi: Cache::default(), typescript: Cache::default(), auth: auth.clone() });
+    let checked = state.db.read(move |_, schema| {
+        auth.check_schema(schema);
+        Ok(())
+    });
+    checked.await.map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut app = router.fallback(not_found).with_state(state);
+    if let Some(origins) = &config.cors {
+        app = app.layer(middleware::from_fn_with_state(Arc::new(origins.clone()), cors::layer));
     }
-    let state = Arc::new(App { db, limits, openapi: Arc::default(), auth: auth.clone() });
-    if let Some(auth) = auth {
-        let checked = state.db.read(move |_, schema| {
-            auth.check_schema(schema);
-            Ok(())
-        });
-        checked.await.map_err(|e| std::io::Error::other(e.to_string()))?;
-    }
-    let app = router.fallback(not_found).with_state(state);
 
-    let mode = if config.auth.jwt_secret.is_some() { "with auth" } else { "without auth" };
-    eprintln!("rulite: serving {} {mode} on http://{addr}", config.db_path.display());
+    if config.tls.is_none() && !addr.ip().is_loopback() {
+        eprintln!("rulite: serving plain HTTP on {addr}; put an HTTPS proxy in front (see README)");
+    }
+    eprintln!("rulite: serving {} on {scheme}://{addr}", config.db_path.display());
+    #[cfg(feature = "tls")]
+    if let Some(tls) = tls {
+        let listener = crate::tls::TlsListener::new(listener, tls)?;
+        return axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
+    }
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await
 }
 
-/// The request's role and grant; with auth off, everything is allowed.
+/// The request's role and grant.
 struct Caller {
     grant: Grant,
     /// Denials answer `401` for anon, `403` otherwise.
     anon: bool,
     service: bool,
-    auth: Option<Arc<Auth>>,
+    auth: Arc<Auth>,
 }
 
 impl Caller {
     fn of(app: &App, headers: &HeaderMap) -> Result<Caller, Response> {
-        let Some(auth) = &app.auth else {
-            return Ok(Caller { grant: Grant::default(), anon: false, service: true, auth: None });
-        };
-        let role = auth.role(headers).map_err(jwt_error)?;
+        let role = app.auth.role(headers).map_err(jwt_error)?;
         let (anon, service) = (role == Role::Anon, role == Role::Service);
-        Ok(Caller { grant: auth.grant(role), anon, service, auth: Some(auth.clone()) })
+        Ok(Caller { grant: app.auth.grant(role), anon, service, auth: app.auth.clone() })
     }
 
     /// Logs config names the schema lacks when the schema moved.
     fn check(&self, schema: &Schema) {
-        if let Some(auth) = &self.auth {
-            auth.check_schema(schema);
-        }
+        self.auth.check_schema(schema);
     }
 
     fn build_error(&self, e: BuildError) -> Response {
@@ -123,23 +140,37 @@ fn parse_headers(headers: &HeaderMap) -> Result<Headers, ParseError> {
     )
 }
 
-/// With auth on, for `service_role` only.
+/// For `service_role` only.
 async fn openapi_document(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let caller = match Caller::of(&app, &headers) {
+    let cache = app.openapi.clone();
+    schema_document(&app, &headers, "the OpenAPI document", cache, openapi::document, OPENAPI).await
+}
+
+/// `supabase gen types typescript` output, as postgres-meta serves it; for `service_role` only.
+async fn typescript_types(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let cache = app.typescript.clone();
+    schema_document(&app, &headers, "the TypeScript types", cache, typescript::generate, TYPESCRIPT).await
+}
+
+/// A document that reveals the whole schema: `service_role` only (anon `401`,
+/// authenticated `403`), rebuilt only when the schema version moves.
+async fn schema_document(
+    app: &App,
+    headers: &HeaderMap,
+    what: &str,
+    cache: Cache,
+    build: fn(&Schema) -> String,
+    content_type: &'static str,
+) -> Response {
+    let caller = match Caller::of(app, headers) {
         Ok(c) => c,
         Err(r) => return r,
     };
     if !caller.service {
         let status = if caller.anon { StatusCode::UNAUTHORIZED } else { StatusCode::FORBIDDEN };
-        return error(
-            status,
-            "42501",
-            "permission denied for the OpenAPI document",
-            None,
-            Some("Use the service_role key"),
-        );
+        let message = format!("permission denied for {what}");
+        return error(status, "42501", &message, None, Some("Use the service_role key"));
     }
-    let cache = app.openapi.clone();
     let result = app
         .db
         .read(move |_, schema| {
@@ -147,7 +178,7 @@ async fn openapi_document(State(app): State<Arc<App>>, headers: HeaderMap) -> Re
             match &*cached {
                 Some((version, doc)) if *version == schema.version => Ok(doc.clone()),
                 _ => {
-                    let doc = Bytes::from(openapi::document(schema));
+                    let doc = Bytes::from(build(schema));
                     *cached = Some((schema.version, doc.clone()));
                     Ok(doc)
                 }
@@ -155,7 +186,7 @@ async fn openapi_document(State(app): State<Arc<App>>, headers: HeaderMap) -> Re
         })
         .await;
     match result {
-        Ok(doc) => ([(header::CONTENT_TYPE, OPENAPI)], doc).into_response(),
+        Ok(doc) => ([(header::CONTENT_TYPE, content_type)], doc).into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -492,7 +523,8 @@ mod tests {
 
     #[test]
     fn auth_errors() {
-        let caller = |anon| Caller { grant: Grant::default(), anon, service: false, auth: None };
+        let auth = Arc::new(Auth::new(&crate::config::Auth::default(), "0123456789abcdef0123456789abcdef", "http://x"));
+        let caller = |anon| Caller { grant: Grant::default(), anon, service: false, auth: auth.clone() };
         let denied = || BuildError::PermissionDenied("t".into());
         assert_eq!(caller(true).build_error(denied()).status(), StatusCode::UNAUTHORIZED);
         assert_eq!(caller(false).build_error(denied()).status(), StatusCode::FORBIDDEN);

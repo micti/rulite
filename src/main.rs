@@ -2,6 +2,7 @@ mod access;
 mod auth;
 mod cli;
 mod config;
+mod cors;
 mod db;
 mod jwt;
 mod openapi;
@@ -9,6 +10,9 @@ mod query;
 mod schema;
 mod server;
 mod sql;
+#[cfg(feature = "tls")]
+mod tls;
+mod typescript;
 mod write;
 
 use std::process::ExitCode;
@@ -27,6 +31,7 @@ fn main() -> ExitCode {
         Command::Serve(config) => return serve(&config),
         Command::User { db_path, action, auth } => cli::user(&db_path, &action, &auth),
         Command::Keys(auth) => cli::keys(&auth),
+        Command::GenTypes(db_path) => cli::gen_types(&db_path),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -38,14 +43,11 @@ fn main() -> ExitCode {
 }
 
 fn serve(config: &Config) -> ExitCode {
-    if config.auth.jwt_secret.is_some() {
-        let created =
-            rusqlite::Connection::open_with_flags(&config.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-                .and_then(|c| auth::ensure_tables(&c));
-        if let Err(e) = created {
-            eprintln!("rulite: cannot create the auth tables in {}: {e}", config.db_path.display());
-            return ExitCode::FAILURE;
-        }
+    let created = rusqlite::Connection::open_with_flags(&config.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .and_then(|c| auth::ensure_tables(&c));
+    if let Err(e) = created {
+        eprintln!("rulite: cannot create the auth tables in {}: {e}", config.db_path.display());
+        return ExitCode::FAILURE;
     }
 
     let (db, threads) = match db::open(&config.db_path, config.readers) {
@@ -56,10 +58,12 @@ fn serve(config: &Config) -> ExitCode {
         }
     };
 
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-        .and_then(|rt| rt.block_on(server::run(config, db)));
+    let mut runtime = tokio::runtime::Builder::new_current_thread();
+    runtime.enable_io();
+    // The TLS handshake timeout.
+    #[cfg(feature = "tls")]
+    runtime.enable_time();
+    let result = runtime.build().and_then(|rt| rt.block_on(server::run(config, db)));
 
     // The server (and with it the last `Db` handle) is gone: DB threads drain and exit.
     threads.join();
