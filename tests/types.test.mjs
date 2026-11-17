@@ -50,11 +50,14 @@ describe('type export', () => {
   test('rulite gen types prints the same file offline', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rulite-types-'))
     try {
-      const db = new DatabaseSync(join(dir, 'event.db'))
-      db.exec(readFileSync(join(root, 'sample', 'event.sql'), 'utf8'))
-      db.close()
-      const out = execFileSync(bin, ['gen', 'types', join(dir, 'event.db')], { encoding: 'utf8' })
-      assert.equal(out, golden('event'))
+      // novel's config adds its functions (sample/functions/novel).
+      for (const [name, extra] of [['event', []], ['novel', ['--config', join(root, 'sample', 'novel.json')]]]) {
+        const db = new DatabaseSync(join(dir, `${name}.db`))
+        db.exec(readFileSync(join(root, 'sample', `${name}.sql`), 'utf8'))
+        db.close()
+        const out = execFileSync(bin, ['gen', 'types', join(dir, `${name}.db`), ...extra], { encoding: 'utf8' })
+        assert.equal(out, golden(name), name)
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
