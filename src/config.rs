@@ -16,14 +16,14 @@ Usage: rulite [serve] <db-path> [options]
        rulite user delete <db-path> <email>
        rulite user list <db-path>
        rulite keys                            [--config <file>]
-       rulite gen types <db-path>             TypeScript types for supabase-js
+       rulite gen types <db-path>             [--config <file>]  TypeScript types for supabase-js
 
 Options (env var in brackets):
   --bind <addr>           listen address        [RULITE_BIND]           default 127.0.0.1:3000
   --readers <n>           reader threads, 1-2   [RULITE_READERS]        default 1
   --default-limit <n>     rows when no limit    [RULITE_DEFAULT_LIMIT]  default 100
   --max-limit <n>         upper bound on limit  [RULITE_MAX_LIMIT]      default 1000
-  --config <file>         JSON config: auth, table permissions, CORS and TLS [RULITE_CONFIG]
+  --config <file>         JSON config: auth, permissions, functions, CORS, TLS [RULITE_CONFIG]
   --cors-origins <list>   origins allowed by CORS, comma separated, or *  [RULITE_CORS_ORIGINS]
   --tls-cert <pem>        serve HTTPS with this certificate chain  [RULITE_TLS_CERT]
   --tls-key <pem>         and this private key (--features tls)    [RULITE_TLS_KEY]
@@ -43,8 +43,11 @@ pub enum Command {
     },
     /// Print the anon and service_role keys.
     Keys(Auth),
-    /// Print the TypeScript types of the database.
-    GenTypes(PathBuf),
+    /// Print the TypeScript types of the database (and its functions).
+    GenTypes {
+        db_path: PathBuf,
+        functions: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -68,6 +71,8 @@ pub struct Config {
     pub cors: Option<Origins>,
     /// Plain HTTP when `None`.
     pub tls: Option<Tls>,
+    /// Folder of function files (`/rest/v1/rpc`); none when `None`.
+    pub functions: Option<PathBuf>,
 }
 
 /// PEM files for built-in HTTPS.
@@ -84,6 +89,7 @@ struct FileOptions {
     cors_origins: Option<Origins>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    functions: Option<PathBuf>,
 }
 
 /// Auth settings from the config file; see AUTH.md.
@@ -171,7 +177,7 @@ impl Command {
             }
             "keys" => Command::Keys(auth),
             "gen" => match next("gen command")?.as_str() {
-                "types" => Command::GenTypes(next("database path")?.into()),
+                "types" => Command::GenTypes { db_path: next("database path")?.into(), functions: file.functions },
                 other => return Err(format!("unknown gen command {other}\n\n{USAGE}")),
             },
             "user" => {
@@ -247,7 +253,17 @@ fn serve(
         (Some(cert), Some(key)) => Some(Tls { cert, key }),
         _ => return Err("tls_cert and tls_key (--tls-cert, --tls-key) must be set together".into()),
     };
-    Ok(Config { db_path: db_path.into(), bind, readers: readers as usize, default_limit, max_limit, auth, cors, tls })
+    Ok(Config {
+        db_path: db_path.into(),
+        bind,
+        readers: readers as usize,
+        default_limit,
+        max_limit,
+        auth,
+        cors,
+        tls,
+        functions: file.functions,
+    })
 }
 
 fn num(name: &str, value: Option<String>, default: u32) -> Result<u32, String> {
@@ -265,6 +281,7 @@ fn load_config(
 ) -> Result<(Auth, FileOptions), String> {
     let mut auth = Auth::default();
     let mut options = FileOptions::default();
+    let mut rpc = None;
     if let Some(path) = path {
         let dir = Path::new(&path).parent().unwrap_or(Path::new(""));
         let file: Value = serde_json::from_str(&read(&path)?).map_err(|e| format!("{path}: {e}"))?;
@@ -293,8 +310,14 @@ fn load_config(
                 }
                 "tls_cert" => options.tls_cert = Some(dir.join(text()?)),
                 "tls_key" => options.tls_key = Some(dir.join(text()?)),
+                "functions" => options.functions = Some(dir.join(text()?)),
+                "rpc" => rpc = Some(value),
                 _ => return Err(format!("{path}: unknown field {key}")),
             }
+        }
+        // After `tables`, which resets the policies.
+        if let Some(rpc) = rpc {
+            auth.access.parse_rpc(rpc).map_err(|e| format!("{path}: {e}"))?;
         }
     }
     if let Some(secret) = env("RULITE_JWT_SECRET").filter(|s| !s.is_empty()) {
@@ -405,6 +428,23 @@ mod tests {
     }
 
     #[test]
+    fn functions_and_rpc_grants() {
+        let file = format!(
+            r#"{{"jwt_secret":"{SECRET}","functions":"fns","rpc":{{"f":{{"anon":"execute"}}}},"tables":{{"t":{{"anon":"read"}}}}}}"#
+        );
+        let Command::Serve(c) = run(&["a.db", "--config", "conf/c.json"], &[], &[("conf/c.json", &file)]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(c.functions, Some(PathBuf::from("conf/fns")));
+        assert!(c.auth.access.anon.may_execute("f") && !c.auth.access.authenticated.may_execute("f"));
+        assert_eq!(c.auth.access.anon.rule("t").perm, crate::sql::Perm::Read);
+        assert_eq!(parse(&["a.db"], &[]).unwrap().functions, None);
+        let bad = format!(r#"{{"jwt_secret":"{SECRET}","rpc":{{"f":{{"anon":"read"}}}}}}"#);
+        assert!(run(&["a.db", "--config", "c.json"], &[], &[("c.json", &bad)]).is_err());
+    }
+
+    #[test]
     fn config_refusals() {
         for bad in [
             r#"{"jwt_secret":"short"}"#,
@@ -509,7 +549,15 @@ mod tests {
         assert!(user(&["user", "nope", "a.db"]).is_err());
         assert!(user(&["user", "add", "a.db", "--bind", "x"]).is_err());
 
-        assert!(matches!(run(&["gen", "types", "a.db"], &[], &[]), Ok(Command::GenTypes(p)) if p == Path::new("a.db")));
+        assert!(matches!(
+            run(&["gen", "types", "a.db"], &[], &[]),
+            Ok(Command::GenTypes { db_path, functions: None }) if db_path == Path::new("a.db")
+        ));
+        let files = [("conf/c.json", r#"{"functions": "fns"}"#)];
+        assert!(matches!(
+            run(&["gen", "types", "a.db", "--config", "conf/c.json"], &[], &files),
+            Ok(Command::GenTypes { functions: Some(f), .. }) if f == Path::new("conf/fns")
+        ));
         assert!(run(&["gen", "types"], &[], &[]).is_err());
         assert!(run(&["gen", "nope", "a.db"], &[], &[]).is_err());
         assert!(run(&["gen", "types", "a.db", "b.db"], &[], &[]).is_err());

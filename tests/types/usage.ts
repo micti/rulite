@@ -53,5 +53,37 @@ export async function writes() {
   await novel.from('nope').select()
 }
 
+export async function views() {
+  const { data } = await novel.from('novel_stats').select('title, editions').eq('status', 'completed')
+  if (!data) return
+  const title: string | null = data[0].title
+  void title
+  // @ts-expect-error: a view has no Insert type
+  await novel.from('novel_stats').insert({ title: 'T' })
+}
+
+export async function functions() {
+  const { data } = await novel.rpc('search_novels', { q: 'Road' }).eq('status', 'completed').order('title')
+  if (data) {
+    const title: string | null = data[0].title
+    void title
+  }
+  const count = await novel.rpc('novel_count', { status: 'hiatus' })
+  const summary = await novel.rpc('novel_summary')
+  const added = await novel.rpc('add_novel', { title: 'T', author: 'A' })
+  const id: string | null | undefined = added.data?.id
+  await todo.rpc('clear_done', { drop_empty: true })
+  await todo.rpc('my_open_todos')
+  void [count.data, summary.data, id]
+
+  // @ts-expect-error: q is required
+  await novel.rpc('search_novels', {})
+  // @ts-expect-error: max is a number
+  await novel.rpc('search_novels', { q: 'x', max: 'many' })
+  // @ts-expect-error: unknown function
+  await novel.rpc('nope')
+}
+
 export const row: Tables<'chapter'> = { id: 'c', volume_id: 'v', number: 1, title: 'T' }
+export const statsRow: Tables<'novel_stats'> = { id: 'n', title: 'T', status: 's', editions: 1 }
 export const insert: TablesInsert<'chapter'> = { volume_id: 'v', number: 1, title: 'T' }

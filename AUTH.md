@@ -144,6 +144,11 @@ A signed-out session's access token stays valid until it expires (`jwt_exp`, def
     "list":    { "authenticated": "write", "owner": "owner_id" },
     "todo":    { "authenticated": "write", "owner": "user_id" },
     "comment": { "anon": "read", "authenticated": "write", "owner": "author_id", "owner_scope": "write" }
+  },
+  "functions": "functions",
+  "rpc": {
+    "*":            { "authenticated": "execute" },
+    "search_posts": { "anon": "execute" }
   }
 }
 ```
@@ -156,6 +161,8 @@ A signed-out session's access token stays valid until it expires (`jwt_exp`, def
 | `refresh_token_reuse_interval` | `10` | Seconds an already-used refresh token is still accepted (parallel tabs refreshing at once). |
 | `password_min_length` | `6` | Applies to `user add`, `user passwd` and `updateUser({ password })`. |
 | `tables` | `{}` | Permissions per table, see below. Without any grant only `service_role` works (logged at startup). |
+| `functions` | none | Folder of function files (`*.sql`) for `/rest/v1/rpc/<name>`, relative to the config file. See [README › Functions](README.md#functions-rpc). |
+| `rpc` | `{}` | Who may call each function, see [Functions](#functions). |
 | `cors_origins` | none | Origins a browser app may call from: `["http://localhost:5173", …]` or `"*"` (`--cors-origins`, `RULITE_CORS_ORIGINS`). See [README › Deploy](README.md#deploy). |
 | `tls_cert`, `tls_key` | none | PEM certificate chain and private key for built-in HTTPS, relative to the config file (`--tls-cert` / `--tls-key`, `RULITE_TLS_CERT` / `RULITE_TLS_KEY`). Needs a build with `--features tls`. |
 
@@ -184,6 +191,35 @@ Each entry in `tables` may set:
 
 Embedded resources are checked too: `select('*, todo(*)')` needs `read` on `todo` as well (and on the
 junction table of a many-to-many embed).
+
+Views are tables here: grant them in `tables`. They are read-only, so `write` acts as `read` (logged at startup).
+
+## Functions
+
+Each entry in `rpc` sets `anon` and `authenticated` to `execute` or `none`; `"*"` sets the defaults, as in
+`tables`. **A function nobody granted can only be called with the `service_role` key**: `anon` gets `401`,
+`authenticated` `403` (`42501`, `permission denied for function <name>`). An entry naming no function file
+stops the server at startup.
+
+A function runs its SQL with full access, like a PostgreSQL `SECURITY DEFINER` function: table grants and
+owner rows are **not** applied inside it. It sees who calls it through two parameters that are always bound:
+
+| Parameter | Value |
+|---|---|
+| `:auth_uid` | the signed-in user's id; `NULL` for `anon` and `service_role` |
+| `:auth_role` | `anon`, `authenticated` or `service_role` |
+
+So a function over owner rows filters them itself:
+
+```sql
+-- @param list_id text
+-- @param title text
+-- @returns row
+INSERT INTO todo (list_id, user_id, title)
+SELECT :list_id, :auth_uid, :title
+WHERE EXISTS (SELECT 1 FROM list WHERE id = :list_id AND owner_id = :auth_uid)
+RETURNING id, title;
+```
 
 ## Owner rows
 
@@ -226,6 +262,7 @@ REST errors use PostgREST's `{code, message, details, hint}`; auth errors use Go
 | Expired token | 401 | `PGRST303` |
 | Role lacks the permission (anon / authenticated), incl. OpenAPI and types | 401 / 403 | `42501` |
 | Owner column set to another user | 403 | `42501` |
+| Function not granted to the role | 401 / 403 | `42501` |
 | Wrong email or password | 400 | `invalid_credentials` |
 | Unknown, used or revoked refresh token | 400 | `refresh_token_not_found` / `refresh_token_already_used` |
 | Session signed out, user deleted | 403 | `session_not_found` / `user_not_found` |
@@ -235,7 +272,8 @@ REST errors use PostgREST's `{code, message, details, hint}`; auth errors use Go
 ## Limits
 
 - One HS256 secret; no asymmetric keys, no key rotation without signing everyone out.
-- Permissions are per table and role, not per column. The only row rule is the owner column.
+- Permissions are per table and role, not per column. The only row rule is the owner column (and, inside
+  functions, whatever their SQL does with `:auth_uid`).
 - Config is read at startup; restart after changing it.
 - Built for development and testing. Put it behind an HTTPS proxy (Caddy, see [README › Deploy](README.md#deploy))
   before exposing it on a VPS; built-in TLS (`--features tls`) works but is not the recommended setup.

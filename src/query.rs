@@ -164,6 +164,24 @@ pub fn parse_query(raw: &str) -> Result<Query> {
     Ok(q)
 }
 
+/// Splits a query string: the pairs whose decoded key `is_arg` accepts
+/// (decoded; a function's arguments on `GET /rpc/fn`), and the other pairs,
+/// still raw, for [`parse_query`].
+pub fn split_args(raw: &str, is_arg: impl Fn(&str) -> bool) -> Result<(Vec<(String, String)>, String)> {
+    let mut args = Vec::new();
+    let mut rest = Vec::new();
+    for pair in raw.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode(key)?;
+        if is_arg(&key) {
+            args.push((key, decode(value)?));
+        } else {
+            rest.push(pair);
+        }
+    }
+    Ok((args, rest.join("&")))
+}
+
 /// A filter or modifier, optionally prefixed by an embed path:
 /// `col`, `edition.language`, `edition.order`, `not.or`, `edition.not.and`.
 fn apply_param(q: &mut Query, key: &str, value: &str) -> Result<()> {
@@ -997,5 +1015,15 @@ mod tests {
         assert!(h.single_object);
         assert_eq!(Headers::parse([], None, None).unwrap(), Headers::default());
         assert!(Headers::parse([], Some("x"), None).is_err());
+    }
+
+    #[test]
+    fn split_function_args() {
+        let (args, rest) =
+            split_args("q=a%20b&select=title&status=eq.done&max=3&q", |k| k == "q" || k == "max").unwrap();
+        assert_eq!(args, [("q".into(), "a b".into()), ("max".into(), "3".into()), ("q".into(), String::new())]);
+        assert_eq!(rest, "select=title&status=eq.done");
+        assert_eq!(split_args("", |_| true).unwrap(), (Vec::new(), String::new()));
+        assert!(split_args("q=%zz", |_| true).is_err());
     }
 }

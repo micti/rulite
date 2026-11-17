@@ -1,8 +1,9 @@
 //! TypeScript types for supabase-js, laid out as `supabase gen types typescript`
-//! prints them, built from the schema cache by hand.
+//! prints them, built from the schema cache and the functions by hand.
 
 use std::fmt::Write;
 
+use crate::rpc::{ArgType, Function, Functions, Returns};
 use crate::schema::{Affinity, Column, Schema, Table};
 
 const JSON: &str = "\
@@ -150,22 +151,18 @@ export const Constants = {
 } as const
 "#;
 
-/// The `database.types.ts` text for `schema`.
-pub fn generate(schema: &Schema) -> String {
+/// The `database.types.ts` text for `schema` and `functions`.
+pub fn generate(schema: &Schema, functions: &Functions) -> String {
     let mut out = String::with_capacity(8192);
     out.push_str(JSON);
     let mut tables: Vec<&Table> = schema.tables.iter().collect();
     tables.sort_by(|a, b| a.name.cmp(&b.name));
-    if tables.is_empty() {
-        writeln!(out, "    Tables: {NEVER}").unwrap();
-    } else {
-        out.push_str("    Tables: {\n");
-        for t in tables {
-            table(&mut out, t);
-        }
-        out.push_str("    }\n");
-    }
-    for section in ["Views", "Functions", "Enums", "CompositeTypes"] {
+    let (views, tables): (Vec<&Table>, Vec<&Table>) = tables.into_iter().partition(|t| t.view);
+    section(&mut out, "Tables", &tables, |out, t| table(out, t));
+    section(&mut out, "Views", &views, |out, t| table(out, t));
+    let functions: Vec<&Function> = functions.iter().collect();
+    section(&mut out, "Functions", &functions, |out, f| function(out, f));
+    for section in ["Enums", "CompositeTypes"] {
         writeln!(out, "    {section}: {NEVER}").unwrap();
     }
     out.push_str("  }\n}\n\n");
@@ -173,11 +170,26 @@ pub fn generate(schema: &Schema) -> String {
     out
 }
 
+/// `name: { ... }` with one entry per item, or `never` without items.
+fn section<T>(out: &mut String, name: &str, items: &[T], mut each: impl FnMut(&mut String, &T)) {
+    if items.is_empty() {
+        writeln!(out, "    {name}: {NEVER}").unwrap();
+        return;
+    }
+    writeln!(out, "    {name}: {{").unwrap();
+    for item in items {
+        each(out, item);
+    }
+    out.push_str("    }\n");
+}
+
+/// A table (`Row`, `Insert`, `Update`, `Relationships`) or a view (`Row` only).
 fn table(out: &mut String, t: &Table) {
     let mut columns: Vec<&Column> = t.columns.iter().collect();
     columns.sort_by(|a, b| a.name.cmp(&b.name));
     writeln!(out, "      {}: {{", name(&t.name)).unwrap();
-    for part in ["Row", "Insert", "Update"] {
+    let parts: &[&str] = if t.view { &["Row"] } else { &["Row", "Insert", "Update"] };
+    for &part in parts {
         writeln!(out, "        {part}: {{").unwrap();
         for c in &columns {
             let optional = match part {
@@ -212,6 +224,44 @@ fn table(out: &mut String, t: &Table) {
             .unwrap();
         }
         out.push_str("        ]\n");
+    }
+    out.push_str("      }\n");
+}
+
+/// `Args` (sorted, optional when they have a default) and `Returns`.
+fn function(out: &mut String, f: &Function) {
+    writeln!(out, "      {}: {{", name(&f.name)).unwrap();
+    let mut args: Vec<_> = f.args.iter().collect();
+    args.sort_by(|a, b| a.name.cmp(&b.name));
+    if args.is_empty() {
+        out.push_str("        Args: never\n");
+    } else {
+        out.push_str("        Args: {\n");
+        for a in args {
+            let mark = if a.default.is_some() { "?" } else { "" };
+            let ty = match a.ty {
+                ArgType::Text => "string",
+                ArgType::Integer | ArgType::Real => "number",
+                ArgType::Boolean => "boolean",
+                ArgType::Json => "Json",
+            };
+            writeln!(out, "          {}{mark}: {ty}", name(&a.name)).unwrap();
+        }
+        out.push_str("        }\n");
+    }
+    let mut columns = f.result_columns();
+    match f.returns {
+        Returns::Void => out.push_str("        Returns: undefined\n"),
+        Returns::Json => out.push_str("        Returns: Json\n"),
+        Returns::Value => writeln!(out, "        Returns: {} | null", ts_type(&columns[0])).unwrap(),
+        Returns::Setof | Returns::Row => {
+            columns.sort_by(|a, b| a.name.cmp(&b.name));
+            out.push_str("        Returns: {\n");
+            for c in &columns {
+                writeln!(out, "          {}: {} | null", name(&c.name), ts_type(c)).unwrap();
+            }
+            out.push_str(if f.returns == Returns::Setof { "        }[]\n" } else { "        }\n" });
+        }
     }
     out.push_str("      }\n");
 }
@@ -260,7 +310,7 @@ mod tests {
     fn types(sql: &str) -> String {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(sql).unwrap();
-        generate(&introspect(&conn).unwrap())
+        generate(&introspect(&conn).unwrap(), &Functions::default())
     }
 
     /// The lines of `table`'s `part` block (`Row`, `Insert`, `Update`, `Relationships`).
@@ -396,13 +446,82 @@ mod tests {
     }
 
     #[test]
+    fn views_and_functions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, meta JSON);
+             CREATE VIEW v AS SELECT name, meta, id * 2 AS twice FROM t;",
+        )
+        .unwrap();
+        let parse = |name: &str, text: &str| crate::rpc::parse(name, text).unwrap();
+        let functions = crate::rpc::check(
+            &conn,
+            vec![
+                parse("find", "-- @param q text\n-- @param n integer = 1\nSELECT id, name FROM t WHERE name = :q LIMIT :n"),
+                parse("one", "-- @returns row\nSELECT meta FROM t"),
+                parse("total", "-- @returns value\nSELECT id FROM t"),
+                parse("doc", "-- @param flag boolean\n-- @param j json\n-- @returns json\nSELECT json_object('f', :flag, 'j', :j)"),
+                parse("clear", "-- @returns void\nDELETE FROM t"),
+            ],
+        )
+        .unwrap();
+        let out = generate(&introspect(&conn).unwrap(), &functions);
+        assert!(!out.contains("      v: {\n        Row: {\n          meta: Json | null\n          name: string | null\n          twice: unknown | null\n        }\n        Insert"));
+        assert!(out.contains("    Views: {\n      v: {\n        Row: {\n          meta: Json | null\n          name: string | null\n          twice: unknown | null\n        }\n        Relationships: []\n      }\n    }\n"));
+        assert!(out.contains("    Tables: {\n      t: {"));
+        let functions_block = &out[out.find("    Functions: {\n").unwrap()..out.find("    Enums:").unwrap()];
+        assert_eq!(
+            functions_block,
+            "    Functions: {
+      clear: {
+        Args: never
+        Returns: undefined
+      }
+      doc: {
+        Args: {
+          flag: boolean
+          j: Json
+        }
+        Returns: Json
+      }
+      find: {
+        Args: {
+          n?: number
+          q: string
+        }
+        Returns: {
+          id: number | null
+          name: string | null
+        }[]
+      }
+      one: {
+        Args: never
+        Returns: {
+          meta: Json | null
+        }
+      }
+      total: {
+        Args: never
+        Returns: number | null
+      }
+    }
+"
+        );
+    }
+
+    #[test]
     fn golden_files() {
         for name in ["novel", "event", "todo"] {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             conn.execute_batch(crate::auth::TABLES).unwrap();
             let sql = std::fs::read_to_string(format!("{}/sample/{name}.sql", env!("CARGO_MANIFEST_DIR"))).unwrap();
             conn.execute_batch(&sql).unwrap();
-            let out = generate(&introspect(&conn).unwrap());
+            let dir = format!("{}/sample/functions/{name}", env!("CARGO_MANIFEST_DIR"));
+            let functions = match std::path::Path::new(&dir).is_dir() {
+                true => crate::rpc::check(&conn, crate::rpc::load(dir.as_ref()).unwrap()).unwrap(),
+                false => Functions::default(),
+            };
+            let out = generate(&introspect(&conn).unwrap(), &functions);
             let path = format!("{}/sample/{name}.types.ts", env!("CARGO_MANIFEST_DIR"));
             if std::env::var_os("RULITE_BLESS").is_some() {
                 std::fs::write(&path, &out).unwrap();

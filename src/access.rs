@@ -1,5 +1,6 @@
-//! Table permissions from the config's `tables`: resolves `"*"` and each
-//! entry into one [`Policy`] per role, and checks the names against the schema.
+//! Table permissions from the config's `tables` and function grants from its
+//! `rpc`: resolves `"*"` and each entry into one [`Policy`] per role, and
+//! checks the names against the schema and the functions.
 
 use serde_json::Value;
 
@@ -13,6 +14,8 @@ pub struct Access {
     pub authenticated: Policy,
     /// Config entries with an owner column: `(table, column)`.
     owners: Vec<(String, String)>,
+    /// Function names in `rpc`, without `"*"`.
+    functions: Vec<String>,
 }
 
 /// One entry as written; unset fields fall back to `"*"`.
@@ -37,9 +40,10 @@ impl Access {
             return Err("tables.\"*\": owner must be set per table".into());
         }
         let mut access = Access {
-            anon: Policy { tables: Vec::new(), default: rule(star.anon, None, false) },
-            authenticated: Policy { tables: Vec::new(), default: rule(star.authenticated, None, false) },
+            anon: Policy { default: rule(star.anon, None, false), ..Policy::default() },
+            authenticated: Policy { default: rule(star.authenticated, None, false), ..Policy::default() },
             owners: Vec::new(),
+            functions: Vec::new(),
         };
         for (name, v) in tables.iter().filter(|(name, _)| *name != "*") {
             let e = entry(name, v)?;
@@ -57,6 +61,34 @@ impl Access {
         }
         // serde_json's map is sorted, so the policies are too.
         Ok(access)
+    }
+
+    /// Fills both policies' function grants from the `rpc` object: each entry
+    /// maps `anon` / `authenticated` to `execute` or `none`; unset fields fall
+    /// back to `"*"`, and an ungranted function is closed.
+    pub fn parse_rpc(&mut self, rpc: &Value) -> Result<(), String> {
+        let rpc = rpc.as_object().ok_or("rpc must be an object")?;
+        let star = match rpc.get("*") {
+            Some(v) => execute_entry("*", v)?,
+            None => (None, None),
+        };
+        self.anon.functions_default = star.0.unwrap_or(false);
+        self.authenticated.functions_default = star.1.unwrap_or(false);
+        for (name, v) in rpc.iter().filter(|(name, _)| *name != "*") {
+            let (anon, authenticated) = execute_entry(name, v)?;
+            self.anon.functions.push((name.clone(), anon.or(star.0).unwrap_or(false)));
+            self.authenticated.functions.push((name.clone(), authenticated.or(star.1).unwrap_or(false)));
+            self.functions.push(name.clone());
+        }
+        Ok(())
+    }
+
+    /// Refuses `rpc` entries that name no function.
+    pub fn check_functions(&self, exists: impl Fn(&str) -> bool) -> Result<(), String> {
+        match self.functions.iter().find(|f| !exists(f)) {
+            Some(f) => Err(format!("rpc.{f}: no such function")),
+            None => Ok(()),
+        }
     }
 
     /// Whether any table is open to anon or authenticated.
@@ -79,6 +111,10 @@ impl Access {
                 && table.column(owner).is_none()
             {
                 out.push(format!("tables.{name}: no column {owner}, the table is closed to anon and authenticated"));
+            }
+            let write = |p: &Policy| p.rule(name).perm == Perm::Write;
+            if table.view && (write(&self.anon) || write(&self.authenticated)) {
+                out.push(format!("tables.{name}: a view is read-only, write acts as read"));
             }
         }
         out
@@ -114,6 +150,25 @@ fn entry(name: &str, v: &Value) -> Result<Entry, String> {
     }
     if e.read_all && e.owner.is_none() {
         return Err(format!("tables.{name}: owner_scope needs an owner column"));
+    }
+    Ok(e)
+}
+
+/// One `rpc` entry: `(anon, authenticated)`, `true` for `execute`.
+fn execute_entry(name: &str, v: &Value) -> Result<(Option<bool>, Option<bool>), String> {
+    let fields = v.as_object().ok_or_else(|| format!("rpc.{name} must be an object"))?;
+    let mut e = (None, None);
+    for (field, value) in fields {
+        let grant = match value.as_str() {
+            Some("execute") => true,
+            Some("none") => false,
+            _ => return Err(format!("rpc.{name}.{field}: invalid value {value}")),
+        };
+        match field.as_str() {
+            "anon" => e.0 = Some(grant),
+            "authenticated" => e.1 = Some(grant),
+            _ => return Err(format!("rpc.{name}: unknown field {field}")),
+        }
     }
     Ok(e)
 }
@@ -183,10 +238,33 @@ mod tests {
     }
 
     #[test]
+    fn function_grants() {
+        let mut a = parse(json!({})).unwrap();
+        a.parse_rpc(&json!({
+            "*": { "authenticated": "execute" },
+            "search": { "anon": "execute" },
+            "admin_only": { "authenticated": "none" },
+        }))
+        .unwrap();
+        assert!(a.anon.may_execute("search") && a.authenticated.may_execute("search"));
+        assert!(!a.anon.may_execute("other") && a.authenticated.may_execute("other"));
+        assert!(!a.anon.may_execute("admin_only") && !a.authenticated.may_execute("admin_only"));
+        assert!(!parse(json!({})).unwrap().anon.may_execute("search"));
+        assert_eq!(a.check_functions(|f| f == "search"), Err("rpc.admin_only: no such function".into()));
+        assert_eq!(a.check_functions(|_| true), Ok(()));
+        for bad in
+            [json!([]), json!({ "f": { "anon": "read" } }), json!({ "f": { "service": "execute" } }), json!({ "f": 1 })]
+        {
+            assert!(parse(json!({})).unwrap().parse_rpc(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn warnings_against_the_schema() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE todo (id INTEGER PRIMARY KEY, user_id TEXT); CREATE TABLE note (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE todo (id INTEGER PRIMARY KEY, user_id TEXT); CREATE TABLE note (id INTEGER PRIMARY KEY);
+             CREATE VIEW recent AS SELECT * FROM todo;",
         )
         .unwrap();
         let schema = crate::schema::introspect(&conn).unwrap();
@@ -194,8 +272,9 @@ mod tests {
             "todo": { "authenticated": "write", "owner": "user_id" },
             "note": { "authenticated": "write", "owner": "author_id" },
             "later": { "anon": "read" },
+            "recent": { "authenticated": "write" },
         }))
         .unwrap();
-        assert_eq!(a.warnings(&schema).len(), 2);
+        assert_eq!(a.warnings(&schema).len(), 3);
     }
 }

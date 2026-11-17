@@ -165,10 +165,54 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      novel_stats: {
+        Row: {
+          editions: unknown | null
+          id: string | null
+          status: string | null
+          title: string | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
-      [_ in never]: never
+      add_novel: {
+        Args: {
+          author: string
+          genre?: string
+          title: string
+        }
+        Returns: {
+          author: string | null
+          genre: string | null
+          id: string | null
+          status: string | null
+          title: string | null
+        }
+      }
+      novel_count: {
+        Args: {
+          status?: string
+        }
+        Returns: unknown | null
+      }
+      novel_summary: {
+        Args: never
+        Returns: Json
+      }
+      search_novels: {
+        Args: {
+          max?: number
+          q: string
+        }
+        Returns: {
+          author: string | null
+          editions: unknown | null
+          id: string | null
+          status: string | null
+          title: string | null
+        }[]
+      }
     }
     Enums: {
       [_ in never]: never

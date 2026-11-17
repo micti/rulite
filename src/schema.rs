@@ -20,6 +20,8 @@ pub struct Schema {
 #[derive(Debug)]
 pub struct Table {
     pub name: String,
+    /// A view: read-only, no keys or relationships.
+    pub view: bool,
     pub strict: bool,
     pub without_rowid: bool,
     /// In declaration order.
@@ -237,9 +239,9 @@ pub fn introspect(conn: &Connection) -> rusqlite::Result<Schema> {
     let mut sqls = Vec::new();
     {
         let mut list = tx.prepare(
-            "SELECT l.name, l.wr, l.strict, s.sql FROM pragma_table_list AS l \
-             JOIN sqlite_schema AS s ON s.type = 'table' AND s.name = l.name \
-             WHERE l.schema = 'main' AND l.type = 'table' AND l.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+            "SELECT l.name, l.wr, l.strict, s.sql, l.type = 'view' FROM pragma_table_list AS l \
+             JOIN sqlite_schema AS s ON s.type = l.type AND s.name = l.name \
+             WHERE l.schema = 'main' AND l.type IN ('table', 'view') AND l.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
              AND l.name NOT IN ('auth_users', 'auth_sessions', 'auth_refresh_tokens') \
              ORDER BY l.name",
         )?;
@@ -248,6 +250,7 @@ pub fn introspect(conn: &Connection) -> rusqlite::Result<Schema> {
             sqls.push(row.get::<_, Option<String>>(3)?.unwrap_or_default());
             tables.push(Table {
                 name: row.get(0)?,
+                view: row.get(4)?,
                 without_rowid: row.get(1)?,
                 strict: row.get(2)?,
                 columns: Vec::new(),
@@ -291,6 +294,9 @@ pub fn introspect(conn: &Connection) -> rusqlite::Result<Schema> {
             c.json = decl == "JSON" || decl == "JSONB" || json_checked.iter().any(|j| j.eq_ignore_ascii_case(&c.name));
         }
 
+        if t.view {
+            continue;
+        }
         let mut pk: Vec<&Column> = t.columns.iter().filter(|c| c.pk > 0).collect();
         pk.sort_by_key(|c| c.pk);
         t.primary_key = pk.iter().map(|c| c.name.clone()).collect();
@@ -478,7 +484,7 @@ mod tests {
     fn novel_tables_and_foreign_keys() {
         let s = novel();
         let tables: Vec<&str> = s.tables.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(tables, ["chapter", "edition", "novel", "part", "volume"]);
+        assert_eq!(tables, ["chapter", "edition", "novel", "novel_stats", "part", "volume"]);
         assert_eq!(s.tables.iter().map(|t| t.foreign_keys.len()).sum::<usize>(), 4);
 
         let part = s.table("part").unwrap();
@@ -500,6 +506,18 @@ mod tests {
         let tables: Vec<&str> = s.tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(tables, ["todo"]);
         assert!(s.table("todo").unwrap().foreign_keys.is_empty());
+    }
+
+    #[test]
+    fn views_are_read_only_tables() {
+        let s = novel();
+        let v = s.table("novel_stats").unwrap();
+        assert!(v.view && !s.table("novel").unwrap().view);
+        let cols: Vec<&str> = v.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, ["id", "title", "status", "editions"]);
+        assert_eq!(v.column("title").unwrap().affinity, Affinity::Text);
+        assert!(v.primary_key.is_empty() && v.uniques.is_empty() && v.relationships.is_empty());
+        assert!(s.relationship("novel_stats", "edition", None).is_err());
     }
 
     #[test]

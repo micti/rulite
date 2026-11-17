@@ -64,6 +64,27 @@ pub enum BuildError {
     PermissionDenied(String),
     /// A written row belongs to another user (owner column).
     RowPolicy(String),
+    /// A write on a view; holds the verb (`insert into`, `update`, `delete from`).
+    ReadOnlyView {
+        verb: &'static str,
+        view: String,
+    },
+    /// No function by that name takes these arguments (sorted); `signature`
+    /// is the declared one, when the name exists.
+    FunctionNotFound {
+        name: String,
+        args: Vec<String>,
+        signature: Option<String>,
+    },
+    /// An argument that doesn't convert to its declared type.
+    InvalidArg {
+        ty: &'static str,
+        value: String,
+    },
+    /// The role may not execute this function.
+    FunctionDenied(String),
+    /// `GET` / `HEAD` on a function that writes.
+    ReadOnlyFunction(String),
 }
 
 impl fmt::Display for BuildError {
@@ -94,6 +115,18 @@ impl fmt::Display for BuildError {
             BuildError::Unsupported(msg) => f.write_str(msg),
             BuildError::PermissionDenied(t) => write!(f, "permission denied for table {t}"),
             BuildError::RowPolicy(t) => write!(f, "new row violates row-level security policy for table \"{t}\""),
+            BuildError::ReadOnlyView { verb, view } => write!(f, "cannot {verb} view \"{view}\""),
+            BuildError::FunctionNotFound { name, args, .. } if args.is_empty() => {
+                write!(f, "Could not find the function public.{name} without parameters in the schema cache")
+            }
+            BuildError::FunctionNotFound { name, args, .. } => {
+                write!(f, "Could not find the function public.{name}({}) in the schema cache", args.join(", "))
+            }
+            BuildError::InvalidArg { ty, value } => write!(f, "invalid input syntax for type {ty}: \"{value}\""),
+            BuildError::FunctionDenied(name) => write!(f, "permission denied for function {name}"),
+            BuildError::ReadOnlyFunction(name) => {
+                write!(f, "cannot execute function {name} in a read-only transaction")
+            }
         }
     }
 }
@@ -119,11 +152,14 @@ pub struct Rule {
     pub read_all: bool,
 }
 
-/// A role's rules: per table (sorted by name), else `default`.
+/// A role's rules: per table (sorted by name), else `default`; which
+/// functions it may execute (sorted by name), else `functions_default`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Policy {
     pub tables: Vec<(String, Rule)>,
     pub default: Rule,
+    pub functions: Vec<(String, bool)>,
+    pub functions_default: bool,
 }
 
 impl Policy {
@@ -131,6 +167,13 @@ impl Policy {
         match self.tables.binary_search_by(|(t, _)| t.as_str().cmp(table)) {
             Ok(i) => &self.tables[i].1,
             Err(_) => &self.default,
+        }
+    }
+
+    pub fn may_execute(&self, function: &str) -> bool {
+        match self.functions.binary_search_by(|(f, _)| f.as_str().cmp(function)) {
+            Ok(i) => self.functions[i].1,
+            Err(_) => self.functions_default,
         }
     }
 }
@@ -158,6 +201,14 @@ impl Grant {
             Some(_) if self.uid.is_none() => Err(denied()),
             Some(_) if need == Perm::Read && rule.read_all => Ok(None),
             Some(name) => table.column(name).map(Some).ok_or_else(denied),
+        }
+    }
+
+    /// Checks that the role may execute `function`.
+    pub fn execute(&self, function: &str) -> Result<()> {
+        match &self.policy {
+            Some(policy) if !policy.may_execute(function) => Err(BuildError::FunctionDenied(function.to_string())),
+            _ => Ok(()),
         }
     }
 }
@@ -280,7 +331,64 @@ pub fn build_select(
     grant: &Grant,
 ) -> Result<Statement> {
     let table = find_table(schema, table)?;
+    select(schema, table, &ident(&table.name), String::new(), Vec::new(), query, rows, limits, grant)
+}
+
+/// The name a function's result goes by in [`build_call`]; a space keeps it
+/// apart from any table.
+pub const CALL: &str = "\"rulite rpc\"";
+
+/// A read-only function (`source`, whose named parameters take `?1..?k`
+/// from `args`) as a table `result`: the page of its rows that the request's
+/// filters, order and paging select.
+#[allow(clippy::too_many_arguments)]
+pub fn build_call(
+    schema: &Schema,
+    source: &str,
+    result: &Table,
+    args: Vec<Value>,
+    query: &Query,
+    range: Option<Range>,
+    count: bool,
+    limits: Limits,
+) -> Result<Read> {
+    let with = format!("WITH {CALL} AS (\n{source}\n) ");
+    let rows = Rows::Page { range, count };
+    let stmt = select(schema, result, CALL, with, args, query, rows, limits, &Grant::default())?;
+    let (_, offset) = paging(query.root(), range, limits);
+    Ok(Read { stmt, offset })
+}
+
+/// The first column of a read-only function's first row as JSON (`null`
+/// without rows); `json` takes it as JSON text the function built.
+pub fn build_scalar(source: &str, result: &Table, args: Vec<Value>, json: bool) -> Statement {
+    let c = &result.columns[0];
+    let value = if json {
+        format!("json(t0.{})", ident(&c.name))
+    } else {
+        format!("json_quote({})", column_value(result, "t0", c))
+    };
+    let sql =
+        format!("WITH {CALL} AS (\n{source}\n) SELECT coalesce((SELECT {value} FROM {CALL} AS t0 LIMIT 1), 'null')");
+    Statement { sql, params: args }
+}
+
+/// [`build_select`] over `source` (a table, or a CTE that `with` defines and
+/// whose parameters are `params`).
+#[allow(clippy::too_many_arguments)]
+fn select(
+    schema: &Schema,
+    table: &Table,
+    source: &str,
+    with: String,
+    params: Vec<Value>,
+    query: &Query,
+    rows: Rows,
+    limits: Limits,
+    grant: &Grant,
+) -> Result<Statement> {
     let mut b = Builder::new(schema, query, limits, grant);
+    b.params = params;
     let alias = b.alias();
     let need = if matches!(rows, Rows::All) { Perm::Write } else { Perm::Read };
     let owner = b.access(table, &alias, need)?;
@@ -322,12 +430,12 @@ pub fn build_select(
         return Err(BuildError::UnknownEmbed(query.scopes[i].path.join(".")));
     }
 
-    let mut from = format!(" FROM {} AS {alias}", ident(&table.name));
+    let mut from = format!(" FROM {source} AS {alias}");
     push_where(&mut from, &conds);
     // The count reuses the page's conditions (and their `?N` parameters).
     let total = if count { format!("(SELECT count(*){from})") } else { "NULL".to_string() };
     let sql = format!(
-        "SELECT json_group_array(json(j)), count(*), {total} FROM (SELECT {object} AS j{from}{order}{paging_sql})"
+        "{with}SELECT json_group_array(json(j)), count(*), {total} FROM (SELECT {object} AS j{from}{order}{paging_sql})"
     );
     Ok(Statement { sql, params: b.params })
 }
@@ -543,28 +651,29 @@ impl<'a> Builder<'a> {
                 (*negated, format!("({})", parts.join(sep)))
             }
             Condition::Filter { column: name, negated, op } => {
-                let col = format!("{alias}.{}", ident(&column(table, name)?.name));
+                let c = column(table, name)?;
+                let col = format!("{alias}.{}", ident(&c.name));
                 let sql = match op {
                     Op::Cmp(cmp, value) => {
                         let (op, value) = match cmp {
-                            Cmp::Eq => ("=", value.clone()),
-                            Cmp::Neq => ("<>", value.clone()),
-                            Cmp::Gt => (">", value.clone()),
-                            Cmp::Gte => (">=", value.clone()),
-                            Cmp::Lt => ("<", value.clone()),
-                            Cmp::Lte => ("<=", value.clone()),
+                            Cmp::Eq => ("=", filter_value(c, value)),
+                            Cmp::Neq => ("<>", filter_value(c, value)),
+                            Cmp::Gt => (">", filter_value(c, value)),
+                            Cmp::Gte => (">=", filter_value(c, value)),
+                            Cmp::Lt => ("<", filter_value(c, value)),
+                            Cmp::Lte => ("<=", filter_value(c, value)),
                             // SQLite's LIKE ignores ASCII case; GLOB is the case-sensitive match.
-                            Cmp::Like => ("GLOB", like_to_glob(value)),
-                            Cmp::Ilike => ("LIKE", value.clone()),
+                            Cmp::Like => ("GLOB", Value::Text(like_to_glob(value))),
+                            Cmp::Ilike => ("LIKE", Value::Text(value.clone())),
                         };
-                        format!("{col} {op} {}", self.param(Value::Text(value)))
+                        format!("{col} {op} {}", self.param(value))
                     }
                     Op::Is(IsValue::Null) => format!("{col} IS NULL"),
                     Op::Is(IsValue::True) => format!("{col} IS TRUE"),
                     Op::Is(IsValue::False) => format!("{col} IS FALSE"),
                     Op::In(values) if values.is_empty() => "0".to_string(),
                     Op::In(values) => {
-                        let list: Vec<String> = values.iter().map(|v| self.param(Value::Text(v.clone()))).collect();
+                        let list: Vec<String> = values.iter().map(|v| self.param(filter_value(c, v))).collect();
                         format!("{col} IN ({})", list.join(", "))
                     }
                 };
@@ -614,6 +723,23 @@ fn column_value(table: &Table, alias: &str, c: &Column) -> String {
     } else {
         col
     }
+}
+
+/// A comparison value: text, which the column's affinity converts; a number
+/// when it looks like one and the column has no declared type (an
+/// expression in a view or a function's result has no affinity).
+fn filter_value(c: &Column, value: &str) -> Value {
+    if c.decl_type.is_empty() {
+        if let Ok(i) = value.parse() {
+            return Value::Integer(i);
+        }
+        if let Ok(f) = value.parse::<f64>()
+            && f.is_finite()
+        {
+            return Value::Real(f);
+        }
+    }
+    Value::Text(value.to_string())
 }
 
 pub fn push_where(sql: &mut String, conds: &[String]) {
@@ -785,6 +911,27 @@ mod tests {
         assert_eq!(t("genre=is.null"), Vec::<String>::new());
         assert_eq!(t("genre=not.is.null&title=gte.R"), ["Signal Drift", "The Lantern Road"]);
         assert_eq!(t("and=(title.gt.A,or(genre.eq.sci-fi,genre.eq.mystery))&title=lt.R"), ["Quiet Harbor"]);
+    }
+
+    #[test]
+    fn views_and_untyped_columns() {
+        let db = novel();
+        let v = get(&db, "novel_stats", "select=title,editions&editions=gte.2&order=title");
+        assert_eq!(v, json!([{ "title": "The Lantern Road", "editions": 2 }]));
+        assert_eq!(get(&db, "novel_stats", "editions=in.(0,2)&select=editions"), json!([{ "editions": 2 }]));
+        let count = build_read(
+            &db.1,
+            "novel_stats",
+            &parse_query("editions=lt.1.5").unwrap(),
+            None,
+            true,
+            LIMITS,
+            &Grant::default(),
+        );
+        assert_eq!(count.unwrap().run(&db.0).unwrap().total, Some(2));
+        let untyped = self::db("CREATE TABLE t (x); INSERT INTO t VALUES (2), ('2'), ('a');");
+        assert_eq!(get(&untyped, "t", "x=eq.2"), json!([{ "x": 2 }]));
+        assert_eq!(get(&untyped, "t", "x=eq.a"), json!([{ "x": "a" }]));
     }
 
     #[test]
@@ -1046,7 +1193,7 @@ mod tests {
             ("todo".to_string(), owner("user_id", false)),
         ];
         tables.sort_by(|a, b| a.0.cmp(&b.0));
-        Arc::new(Policy { tables, default: Rule::default() })
+        Arc::new(Policy { tables, ..Policy::default() })
     }
 
     fn user(uid: &str) -> Grant {
@@ -1075,7 +1222,7 @@ mod tests {
         let anon = Grant {
             policy: Some(Arc::new(Policy {
                 tables: vec![("tag".into(), Rule { perm: Perm::Read, ..Rule::default() })],
-                default: Rule::default(),
+                ..Policy::default()
             })),
             uid: None,
         };
@@ -1091,11 +1238,15 @@ mod tests {
         let only_a = Grant {
             policy: Some(Arc::new(Policy {
                 tables: vec![("a".into(), Rule { perm: Perm::Read, ..Rule::default() })],
-                default: Rule::default(),
+                ..Policy::default()
             })),
             uid: None,
         };
         assert!(read_as(&db2, &only_a, "a", "").is_ok());
+        assert_eq!(only_a.execute("f"), Err(BuildError::FunctionDenied("f".into())));
+        assert_eq!(Grant::default().execute("f"), Ok(()));
+        let f = Policy { functions: vec![("f".into(), true)], ..Policy::default() };
+        assert_eq!(Grant { policy: Some(Arc::new(f)), uid: None }.execute("f"), Ok(()));
         assert_eq!(read_as(&db2, &only_a, "a", "select=*,b(*)"), denied("b"));
         assert_eq!(read_as(&db2, &only_a, "a", "select=*,b!inner()"), denied("b"));
     }

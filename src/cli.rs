@@ -11,7 +11,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use crate::auth;
 use crate::config::{Auth, UserAction};
 use crate::jwt::{self, Key};
-use crate::{schema, typescript};
+use crate::{rpc, schema, typescript};
 
 /// Prints the anon and service_role keys, one `role key` per line.
 pub fn keys(auth: &Auth) -> Result<(), String> {
@@ -22,15 +22,18 @@ pub fn keys(auth: &Auth) -> Result<(), String> {
     Ok(())
 }
 
-/// Prints the TypeScript types of the database, read from a read-only connection.
-pub fn gen_types(db_path: &Path) -> Result<(), String> {
-    let schema = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|c| {
-            c.busy_timeout(Duration::from_secs(5))?;
-            schema::introspect(&c)
-        })
+/// Prints the TypeScript types of the database and of the functions in
+/// `functions`, read from a read-only connection.
+pub fn gen_types(db_path: &Path, functions: Option<&Path>) -> Result<(), String> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|c| c.busy_timeout(Duration::from_secs(5)).map(|_| c))
         .map_err(|e| format!("cannot read {}: {e}", db_path.display()))?;
-    print!("{}", typescript::generate(&schema));
+    let schema = schema::introspect(&conn).map_err(|e| format!("cannot read {}: {e}", db_path.display()))?;
+    let functions = match functions {
+        Some(dir) => rpc::check(&conn, rpc::load(dir)?)?,
+        None => rpc::Functions::default(),
+    };
+    print!("{}", typescript::generate(&schema, &functions));
     Ok(())
 }
 

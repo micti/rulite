@@ -7,8 +7,10 @@ A Supabase-compatible REST API for any SQLite database, written in Rust.
 - REST API generated from the SQLite schema, compatible with [`supabase-js`](https://github.com/supabase/supabase-js)
 - Supabase-style auth (email + password, GoTrue-compatible tokens), `anon` / `authenticated` / `service_role`
   roles, per-table `none | read | write` and owner rows; always on, see [AUTH.md](AUTH.md)
+- Views as read-only tables, and functions for `supabase.rpc()`: SQLite has no `CREATE FUNCTION`, so a
+  function is a `.sql` file whose header declares its arguments (see [Functions](#functions-rpc))
 - TypeScript types as `supabase gen types typescript` prints them, so `createClient<Database>()` type-checks
-  `from()`, `select()` with embeds, `insert()` and `update()`
+  `from()`, `select()` with embeds, `insert()`, `update()` and `rpc()`
 - CORS for browser apps on other origins; optional built-in HTTPS (`--features tls`)
 
 See [PLAN.md](PLAN.md) for the plan, [AUTH.md](AUTH.md) for auth & permissions and [ARCHITECTURE.md](ARCHITECTURE.md) for how it is built.
@@ -37,6 +39,43 @@ rulite app.db --config app.json                   # serve on 127.0.0.1:3000
 Every server runs with auth: it needs a `jwt_secret` (in the config or `RULITE_JWT_SECRET`), and `anon` /
 `authenticated` only see the tables the config grants them. See [AUTH.md](AUTH.md) for the config file.
 
+### Functions (RPC)
+
+SQLite has no stored functions, so a function is a `.sql` file in the folder the config names
+(`"functions": "functions"`, relative to the config file). The file name is the function name; the leading
+`--` comments are its description and its annotations; SQLite named parameters (`:q`) take the arguments:
+
+```sql
+-- functions/search_novels.sql
+-- Novels whose title contains q.
+-- @param q text
+-- @param max integer = 50
+-- @returns setof
+SELECT id, title, status FROM novel WHERE title LIKE '%' || :q || '%' LIMIT :max;
+```
+
+```ts
+const { data } = await supabase.rpc('search_novels', { q: 'Road' }).eq('status', 'completed').order('title')
+```
+
+- `@param <name> <type> [= <default>]`: `text`, `integer`, `real`, `boolean` (bound as 0 / 1) or `json` (bound
+  as JSON text, e.g. for `json_each(:ids)`). A default (a JSON literal: `10`, `"x"`, `null`) makes it optional.
+  Unknown or missing arguments answer `404 PGRST202`, a value of the wrong type `400 22P02`.
+- `@returns setof` (default, an array of rows) | `row` (the first row or `null`) | `value` (the first column of
+  the first row) | `json` (the same, JSON text the function built, e.g. with `json_object()`) | `void` (`204`).
+- `:auth_uid` (the user id, `NULL` for anon and service_role) and `:auth_role` are always bound.
+- A file with one read-only statement runs on a reader, with `POST` or `GET` (`rpc(..., { get: true })`), and a
+  `setof` / `row` result takes `select`, filters, `order`, `limit` / `range()`, `count` and `.single()` like a table.
+- A file that writes (any number of statements) runs in one transaction on the writer and returns the last
+  statement's rows (`INSERT ... RETURNING ...`); an error rolls it all back. It needs `POST`: `GET` answers
+  `405`, and filters on its result `400`.
+- Startup refuses a file with `?` parameters, undeclared or unused parameters, two read-only statements,
+  duplicate result column names, or SQL that doesn't prepare.
+- Only `service_role` may call a function unless the config's `rpc` grants it; functions see every row, so
+  limit rows with `:auth_uid` (see [AUTH.md](AUTH.md#functions)).
+
+Views (`CREATE VIEW`) are served read-only at `/rest/v1/<view>` with the `tables` grants; writes answer `405`.
+
 ### TypeScript types
 
 The same `Database` type as `supabase gen types typescript`, from the running server (with the
@@ -44,7 +83,7 @@ The same `Database` type as `supabase gen types typescript`, from the running se
 
 ```sh
 curl -H "apikey: $SERVICE_KEY" http://127.0.0.1:3000/pg/generators/typescript > database.types.ts
-rulite gen types app.db > database.types.ts
+rulite gen types app.db --config app.json > database.types.ts   # --config adds the functions
 ```
 
 ```ts
@@ -57,7 +96,9 @@ const { data } = await supabase.from('novel').select('title, edition(language)')
 
 Per table: `Row`, `Insert` (optional when nullable, with a default or the rowid), `Update` and `Relationships`
 (one per foreign key). INTEGER / REAL / NUMERIC columns are `number`, TEXT and BLOB (`\x` hex) `string`, JSON
-columns `Json`, columns without a declared type `unknown`. The auth tables are left out.
+columns `Json`, columns without a declared type `unknown`. The auth tables are left out. Views get `Row` only;
+functions get `Args` (optional with a default) and `Returns` (result columns typed by their source column,
+`| null`; expressions such as `count(*)` are `unknown`).
 
 ### Deploy
 
@@ -106,7 +147,9 @@ sqlite3 sample/todo.db < sample/todo.sql     # then: rulite sample/todo.db --con
 rulite keys --config sample/todo.json        # one jwt_secret: the same keys work on all three
 ```
 
-`novel.json` and `event.json` grant `anon` read and write on every table. `sample/*.types.ts` are their
+`novel.json` and `event.json` grant `anon` read and write on every table. `novel.db` has a view
+(`novel_stats`); `sample/functions/novel` and `sample/functions/todo` hold the functions their configs load
+(`todo`'s use `:auth_uid`). `sample/*.types.ts` are their
 TypeScript types (golden files for `cargo test`; `RULITE_BLESS=1 cargo test` rewrites them).
 
 | Database | Tables | Relationship cases |
@@ -129,7 +172,7 @@ npm install
 npm test        # node --test on fresh copies of sample/novel.db and sample/event.db
 ```
 
-`tests/run.mjs` rebuilds the three databases from their `.sql` files in a temp directory (with the built-in `node:sqlite`, so Node ≥ 22.13), adds the users alice, bob and carol (password `secret1`) to `todo.db` with `rulite user add`, reads the keys from `rulite keys`, starts one `target/release/rulite` per database on a free port with its `sample/<name>.json` (novel also with `--cors-origins`), runs every `*.test.mjs` one file at a time and stops the servers afterwards. Tests get `RULITE_NOVEL_URL`, `RULITE_EVENT_URL`, `RULITE_TODO_URL` (`RULITE_URL` is the novel server), `RULITE_ANON_KEY`, `RULITE_SERVICE_KEY` (valid on all three), `RULITE_TODO_CONFIG`, `RULITE_CORS_ORIGINS` and `RULITE_BIN`, which also overrides the binary. Extra arguments go to `node --test`, e.g. `npm test -- --test-reporter=spec`. `auth.test.mjs` covers `/auth/v1`, `access.test.mjs` roles, table permissions and owner rows, `startup.test.mjs` the required secret and closed tables, `types.test.mjs` the type export and `tsc --noEmit` on `tests/types/usage.ts`, `cors.test.mjs` CORS. `tls.test.mjs` runs a build with the `tls` feature over HTTPS (the test certificate in `tests/tls/` is trusted through `NODE_EXTRA_CA_CERTS`, set by `npm test`); build it first, or it is skipped:
+`tests/run.mjs` rebuilds the three databases from their `.sql` files in a temp directory (with the built-in `node:sqlite`, so Node ≥ 22.13), adds the users alice, bob and carol (password `secret1`) to `todo.db` with `rulite user add`, reads the keys from `rulite keys`, starts one `target/release/rulite` per database on a free port with its `sample/<name>.json` (novel also with `--cors-origins`), runs every `*.test.mjs` one file at a time and stops the servers afterwards. Tests get `RULITE_NOVEL_URL`, `RULITE_EVENT_URL`, `RULITE_TODO_URL` (`RULITE_URL` is the novel server), `RULITE_ANON_KEY`, `RULITE_SERVICE_KEY` (valid on all three), `RULITE_TODO_CONFIG`, `RULITE_CORS_ORIGINS` and `RULITE_BIN`, which also overrides the binary. Extra arguments go to `node --test`, e.g. `npm test -- --test-reporter=spec`. `auth.test.mjs` covers `/auth/v1`, `access.test.mjs` roles, table permissions and owner rows, `startup.test.mjs` the required secret and closed tables, `types.test.mjs` the type export and `tsc --noEmit` on `tests/types/usage.ts`, `cors.test.mjs` CORS, `rpc.test.mjs` views and functions. `tls.test.mjs` runs a build with the `tls` feature over HTTPS (the test certificate in `tests/tls/` is trusted through `NODE_EXTRA_CA_CERTS`, set by `npm test`); build it first, or it is skipped:
 
 ```sh
 cargo build --release --features tls --target-dir target/tls     # RULITE_TLS_BIN overrides the path
@@ -185,6 +228,8 @@ Measured 2026-10-17 on an Apple M3 (8 cores), macOS, `oha` on the same machine (
 
 ¹ After the sign-in that fetched the token: the blocking thread that ran bcrypt lingers for 10 s.
 
-The default build grew by 49 KB in phase 3 (type generator, CORS); the TLS crates add 0.8 MB to the `tls` build only. Keep-alive connections pay the TLS handshake once, so HTTPS costs ~3% of throughput here.
+The default build grew by 49 KB in phase 3 (type generator, CORS); the TLS crates add 0.8 MB to the `tls` build only.
+Phase 4 (views, functions) adds 166 KB to the binary and ~0.15 MB to idle RSS (measured on Linux x86-64 against
+the phase 3 commit with the same toolchain; the table read path is unchanged). Keep-alive connections pay the TLS handshake once, so HTTPS costs ~3% of throughput here.
 
 At this size the single-threaded HTTP runtime is the bottleneck, not SQLite, so a second reader only adds RSS and contention; keep the default of 1 unless queries get heavy. Verifying a JWT per request costs under 1% of throughput.
