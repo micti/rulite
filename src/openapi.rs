@@ -4,10 +4,11 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::rpc::{ArgType, Function, Functions, Kind, Returns};
 use crate::schema::{Affinity, Column, Schema, Table};
 
 /// The document as JSON text.
-pub fn document(schema: &Schema) -> String {
+pub fn document(schema: &Schema, functions: &Functions) -> String {
     let mut paths = Map::new();
     paths.insert(
         "/".into(),
@@ -29,6 +30,9 @@ pub fn document(schema: &Schema) -> String {
                         "description": "Filter, e.g. eq.<value>, in.(a,b), is.null" }),
             );
         }
+    }
+    for f in functions.iter() {
+        paths.insert(format!("/rpc/{}", f.name), function_path(f));
     }
 
     json!({
@@ -66,19 +70,23 @@ fn table_path(t: &Table) -> Value {
     let none = json!({ "description": "No content (Prefer: return=minimal)" });
     let error = json!({ "$ref": "#/components/responses/Error" });
 
-    json!({
-        "get": {
-            "tags": [name],
-            "parameters": with(&["select", "order", "limit", "offset", "range", "preferCount"]),
-            "responses": {
-                "200": { "description": "OK", "content": {
-                    "application/json": { "schema": rows },
-                    "application/vnd.pgrst.object+json": { "schema": item },
-                }},
-                "206": { "description": "Partial content", "content": { "application/json": { "schema": rows } } },
-                "default": error,
-            },
+    let get = json!({
+        "tags": [name],
+        "parameters": with(&["select", "order", "limit", "offset", "range", "preferCount"]),
+        "responses": {
+            "200": { "description": "OK", "content": {
+                "application/json": { "schema": rows },
+                "application/vnd.pgrst.object+json": { "schema": item },
+            }},
+            "206": { "description": "Partial content", "content": { "application/json": { "schema": rows } } },
+            "default": error,
         },
+    });
+    if t.view {
+        return json!({ "get": get });
+    }
+    json!({
+        "get": get,
         "post": {
             "tags": [name],
             "parameters": [param_ref("select"), param_ref("columns"), param_ref("onConflict"), param_ref("preferInsert")],
@@ -97,6 +105,49 @@ fn table_path(t: &Table) -> Value {
             "responses": { "200": representation, "204": none, "default": error },
         },
     })
+}
+
+/// `POST /rpc/{name}` with the arguments as a JSON object; `GET` with them
+/// in the query string too, for a read-only function.
+fn function_path(f: &Function) -> Value {
+    let arg_type = |ty| match ty {
+        ArgType::Text => json!({ "type": "string" }),
+        ArgType::Integer => json!({ "type": "integer" }),
+        ArgType::Real => json!({ "type": "number" }),
+        ArgType::Boolean => json!({ "type": "boolean" }),
+        ArgType::Json => json!({}),
+    };
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    let mut query: Vec<Value> = Vec::new();
+    for a in &f.args {
+        properties.insert(a.name.clone(), arg_type(a.ty));
+        if a.default.is_none() {
+            required.push(a.name.clone());
+        }
+        query.push(json!({ "name": a.name, "in": "query", "required": a.default.is_none(), "schema": arg_type(a.ty) }));
+    }
+    let tag = format!("(rpc) {}", f.name);
+    let ok = match f.returns {
+        Returns::Void => json!({ "204": { "description": "No content" } }),
+        _ => json!({ "200": { "description": "OK", "content": { "application/json": {} } } }),
+    };
+    let mut responses = ok;
+    responses["default"] = json!({ "$ref": "#/components/responses/Error" });
+    let body = json!({ "type": "object", "properties": properties, "required": required });
+    let mut path = json!({ "post": {
+        "tags": [tag],
+        "summary": f.description,
+        "requestBody": { "required": false, "content": { "application/json": { "schema": body } } },
+        "responses": responses,
+    }});
+    if f.kind == Kind::Query {
+        if matches!(f.returns, Returns::Setof | Returns::Row) {
+            query.extend(["select", "order", "limit", "offset", "range", "preferCount"].map(param_ref));
+        }
+        path["get"] = json!({ "tags": [tag], "summary": f.description, "parameters": query, "responses": responses });
+    }
+    path
 }
 
 fn table_schema(t: &Table) -> Value {
@@ -222,7 +273,7 @@ mod tests {
     fn doc(sql: &str) -> Value {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(sql).unwrap();
-        serde_json::from_str(&document(&introspect(&conn).unwrap())).unwrap()
+        serde_json::from_str(&document(&introspect(&conn).unwrap(), &Functions::default())).unwrap()
     }
 
     #[test]
@@ -253,6 +304,33 @@ mod tests {
             let (kind, name) = r.split_once('/').unwrap();
             assert!(d["components"][kind][name].is_object(), "{r}");
         }
+    }
+
+    #[test]
+    fn views_and_functions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../sample/novel.sql")).unwrap();
+        let parse = |name: &str, text: &str| crate::rpc::parse(name, text).unwrap();
+        let functions = crate::rpc::check(
+            &conn,
+            vec![
+                parse("find", "-- Novels by title.\n-- @param q text\n-- @param n integer = 5\nSELECT title FROM novel WHERE title = :q LIMIT :n"),
+                parse("wipe", "-- @returns void\nDELETE FROM part"),
+            ],
+        )
+        .unwrap();
+        let d: Value = serde_json::from_str(&document(&introspect(&conn).unwrap(), &functions)).unwrap();
+        let view = d["paths"]["/novel_stats"].as_object().unwrap();
+        assert_eq!(view.keys().collect::<Vec<_>>(), ["get"]);
+        let find = &d["paths"]["/rpc/find"];
+        assert_eq!(find["post"]["summary"], "Novels by title.");
+        assert_eq!(find["post"]["requestBody"]["content"]["application/json"]["schema"]["required"], json!(["q"]));
+        assert_eq!(
+            find["get"]["parameters"][1],
+            json!({ "name": "n", "in": "query", "required": false, "schema": { "type": "integer" } })
+        );
+        assert!(d["paths"]["/rpc/wipe"]["get"].is_null());
+        assert!(d["paths"]["/rpc/wipe"]["post"]["responses"]["204"].is_object());
     }
 
     #[test]

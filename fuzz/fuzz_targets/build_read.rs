@@ -84,7 +84,7 @@ fn grant(schema: &schema::Schema, g: u8) -> sql::Grant {
             (t.name.clone(), sql::Rule { perm, owner, read_all: g & 0x80 != 0 })
         })
         .collect();
-    let policy = sql::Policy { tables, default: sql::Rule::default() };
+    let policy = sql::Policy { tables, ..sql::Policy::default() };
     sql::Grant { policy: Some(Arc::new(policy)), uid: (g & 0x40 != 0).then(|| UID.to_string()) }
 }
 

@@ -148,7 +148,40 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      add_todo: {
+        Args: {
+          list_id: string
+          title: string
+        }
+        Returns: {
+          done: number | null
+          id: string | null
+          list_id: string | null
+          title: string | null
+        }
+      }
+      clear_done: {
+        Args: {
+          drop_empty?: boolean
+        }
+        Returns: undefined
+      }
+      my_open_todos: {
+        Args: never
+        Returns: {
+          created_at: string | null
+          id: string | null
+          list: string | null
+          title: string | null
+        }[]
+      }
+      whoami: {
+        Args: never
+        Returns: {
+          id: unknown | null
+          role: unknown | null
+        }
+      }
     }
     Enums: {
       [_ in never]: never

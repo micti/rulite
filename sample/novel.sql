@@ -4,6 +4,7 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP VIEW IF EXISTS novel_stats;
 DROP TABLE IF EXISTS part;
 DROP TABLE IF EXISTS chapter;
 DROP TABLE IF EXISTS volume;
@@ -53,6 +54,12 @@ CREATE TABLE part (
   UNIQUE (chapter_id, number)
 ) STRICT;
 -- Foreign keys are covered by the leading column of each UNIQUE index.
+
+-- A read-only view: one row per novel with its edition count.
+CREATE VIEW novel_stats AS
+  SELECT n.id, n.title, n.status, count(e.id) AS editions
+  FROM novel AS n LEFT JOIN edition AS e ON e.novel_id = n.id
+  GROUP BY n.id;
 
 -- Seed rows get random ids; children find their parent by natural key.
 INSERT INTO novel (title, author, genre, status) VALUES

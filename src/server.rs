@@ -1,5 +1,5 @@
-//! HTTP layer: routes under `/rest/v1` and `/auth/v1`, the request's role,
-//! PostgREST-shaped errors.
+//! HTTP layer: routes under `/rest/v1` (tables, views and `rpc` functions)
+//! and `/auth/v1`, the request's role, PostgREST-shaped errors.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +20,7 @@ use crate::cors;
 use crate::db::{Db, DbError};
 use crate::openapi;
 use crate::query::{self, Headers, ParseError};
+use crate::rpc::{self, Functions, Kind, Outcome, Returns, Source};
 use crate::schema::Schema;
 use crate::sql::{self, BuildError, Grant, Limits, Page};
 use crate::typescript;
@@ -39,9 +40,10 @@ pub struct App {
     openapi: Cache,
     typescript: Cache,
     pub auth: Arc<Auth>,
+    functions: Arc<Functions>,
 }
 
-pub async fn run(config: &Config, db: Db) -> std::io::Result<()> {
+pub async fn run(config: &Config, db: Db, functions: Functions) -> std::io::Result<()> {
     #[cfg(feature = "tls")]
     let tls = match &config.tls {
         Some(tls) => Some(crate::tls::server_config(&tls.cert, &tls.key).map_err(std::io::Error::other)?),
@@ -62,10 +64,18 @@ pub async fn run(config: &Config, db: Db) -> std::io::Result<()> {
         .route("/rest/v1", get(openapi_document))
         .route("/rest/v1/", get(openapi_document))
         .route("/rest/v1/{table}", get(read_table).post(insert).patch(update).delete(delete))
+        .route("/rest/v1/rpc/{name}", get(call_get).post(call_post))
         .route("/pg/generators/typescript", get(typescript_types))
         .nest("/auth/v1", auth::routes());
-    let state =
-        Arc::new(App { db, limits, openapi: Cache::default(), typescript: Cache::default(), auth: auth.clone() });
+    let functions = Arc::new(functions);
+    let state = Arc::new(App {
+        db,
+        limits,
+        openapi: Cache::default(),
+        typescript: Cache::default(),
+        auth: auth.clone(),
+        functions,
+    });
     let checked = state.db.read(move |_, schema| {
         auth.check_schema(schema);
         Ok(())
@@ -91,6 +101,8 @@ pub async fn run(config: &Config, db: Db) -> std::io::Result<()> {
 /// The request's role and grant.
 struct Caller {
     grant: Grant,
+    /// `anon`, `authenticated` or `service_role`, for `:auth_role`.
+    role: &'static str,
     /// Denials answer `401` for anon, `403` otherwise.
     anon: bool,
     service: bool,
@@ -101,7 +113,12 @@ impl Caller {
     fn of(app: &App, headers: &HeaderMap) -> Result<Caller, Response> {
         let role = app.auth.role(headers).map_err(jwt_error)?;
         let (anon, service) = (role == Role::Anon, role == Role::Service);
-        Ok(Caller { grant: app.auth.grant(role), anon, service, auth: app.auth.clone() })
+        let name = match role {
+            Role::Anon => "anon",
+            Role::Authenticated(_) => "authenticated",
+            Role::Service => "service_role",
+        };
+        Ok(Caller { grant: app.auth.grant(role), role: name, anon, service, auth: app.auth.clone() })
     }
 
     /// Logs config names the schema lacks when the schema moved.
@@ -110,7 +127,8 @@ impl Caller {
     }
 
     fn build_error(&self, e: BuildError) -> Response {
-        let denied = matches!(e, BuildError::PermissionDenied(_) | BuildError::RowPolicy(_));
+        let denied =
+            matches!(e, BuildError::PermissionDenied(_) | BuildError::RowPolicy(_) | BuildError::FunctionDenied(_));
         let mut r = build_error(e);
         if denied && self.anon {
             *r.status_mut() = StatusCode::UNAUTHORIZED;
@@ -159,7 +177,7 @@ async fn schema_document(
     headers: &HeaderMap,
     what: &str,
     cache: Cache,
-    build: fn(&Schema) -> String,
+    build: fn(&Schema, &Functions) -> String,
     content_type: &'static str,
 ) -> Response {
     let caller = match Caller::of(app, headers) {
@@ -171,6 +189,7 @@ async fn schema_document(
         let message = format!("permission denied for {what}");
         return error(status, "42501", &message, None, Some("Use the service_role key"));
     }
+    let functions = app.functions.clone();
     let result = app
         .db
         .read(move |_, schema| {
@@ -178,7 +197,7 @@ async fn schema_document(
             match &*cached {
                 Some((version, doc)) if *version == schema.version => Ok(doc.clone()),
                 _ => {
-                    let doc = Bytes::from(build(schema));
+                    let doc = Bytes::from(build(schema, &functions));
                     *cached = Some((schema.version, doc.clone()));
                     Ok(doc)
                 }
@@ -379,6 +398,107 @@ fn write_response(out: Output, status: StatusCode, count: bool, single: bool) ->
     }
 }
 
+async fn call_get(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    call(app, name, raw, &headers, None).await
+}
+
+async fn call_post(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    call(app, name, raw, &headers, Some(body)).await
+}
+
+/// `/rest/v1/rpc/{name}`. Arguments come from the JSON `body` (`POST`), or
+/// from the query string (`GET` / `HEAD`, `body` is `None`), where the
+/// other pairs filter the result. A query runs on a reader, a procedure on
+/// the writer.
+async fn call(app: Arc<App>, name: String, raw: Option<String>, headers: &HeaderMap, body: Option<String>) -> Response {
+    let caller = match Caller::of(&app, headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Some(f) = app.functions.get(&name) else {
+        let args = body.as_deref().map(rpc::body_names).unwrap_or_default();
+        return build_error(BuildError::FunctionNotFound { name, args, signature: None });
+    };
+    if let Err(e) = caller.grant.execute(&name) {
+        return caller.build_error(e);
+    }
+    let raw = raw.unwrap_or_default();
+    let (source, rest) = match &body {
+        Some(body) => (Source::Body(body), raw),
+        None if f.kind == Kind::Procedure => return build_error(BuildError::ReadOnlyFunction(name)),
+        None => match query::split_args(&raw, |k| f.arg(k).is_some()) {
+            Ok((pairs, rest)) => (Source::Query(pairs), rest),
+            Err(e) => return parse_error(e),
+        },
+    };
+    let args = match rpc::args(f, source, caller.role, caller.grant.uid.as_deref()) {
+        Ok(a) => a,
+        Err(e) => return build_error(e),
+    };
+    let query = match query::parse_query(&rest) {
+        Ok(q) => q,
+        Err(e) => return parse_error(e),
+    };
+    let headers = match parse_headers(headers) {
+        Ok(h) => h,
+        Err(e) => return parse_error(e),
+    };
+    let (count, range, limits, returns) = (headers.prefer.count.is_some(), headers.range, app.limits, f.returns);
+    let functions = app.functions.clone();
+    let result = match f.kind {
+        Kind::Query => {
+            let job = move |conn: &_, schema: &Schema| {
+                let f = functions.get(&name).expect("looked up above");
+                rpc::run_query(conn, schema, f, &args, query, range, count, limits)
+            };
+            app.db.read(job).await
+        }
+        Kind::Procedure => {
+            let job = move |conn: &mut _, _: &Schema| {
+                rpc::run_procedure(conn, functions.get(&name).expect("looked up above"), &args, &query)
+            };
+            app.db.write(job).await
+        }
+    };
+    match result {
+        Ok(Ok(Outcome::Page { offset, page })) => read_response(offset, page, headers.single_object),
+        Ok(Ok(Outcome::Body { body, rows })) => call_response(body, rows, count, headers.single_object, returns),
+        Ok(Err(e)) => caller.build_error(e),
+        Err(e) => db_error(e),
+    }
+}
+
+/// `200` with the body, or `204` for `void`; a single object from a `setof`
+/// procedure needs exactly one row.
+fn call_response(body: Option<String>, rows: u64, count: bool, single: bool, returns: Returns) -> Response {
+    let range = content_range(0, rows, count.then_some(rows));
+    let Some(body) = body else {
+        return (StatusCode::NO_CONTENT, [(header::CONTENT_RANGE, range)]).into_response();
+    };
+    let (content_type, body) = match single && returns == Returns::Setof {
+        true if rows != 1 => return build_error(BuildError::NotSingular(rows)),
+        true => (OBJECT, unwrap_array(body)),
+        false => (JSON, body),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type)), (header::CONTENT_RANGE, range)],
+        body,
+    )
+        .into_response()
+}
+
 fn parse_error(e: ParseError) -> Response {
     error(StatusCode::BAD_REQUEST, "PGRST100", &e.to_string(), None, None)
 }
@@ -418,9 +538,16 @@ fn build_error(e: BuildError) -> Response {
             error(StatusCode::NOT_ACCEPTABLE, "PGRST116", &message, Some(&details), None)
         }
         BuildError::Unsupported(_) => error(StatusCode::BAD_REQUEST, "PGRST100", &message, None, None),
-        BuildError::PermissionDenied(_) | BuildError::RowPolicy(_) => {
+        BuildError::PermissionDenied(_) | BuildError::RowPolicy(_) | BuildError::FunctionDenied(_) => {
             error(StatusCode::FORBIDDEN, "42501", &message, None, None)
         }
+        BuildError::ReadOnlyView { .. } => error(StatusCode::METHOD_NOT_ALLOWED, "55000", &message, None, None),
+        BuildError::FunctionNotFound { signature, .. } => {
+            let hint = signature.map(|s| format!("Perhaps you meant to call the function public.{s}"));
+            error(StatusCode::NOT_FOUND, "PGRST202", &message, None, hint.as_deref())
+        }
+        BuildError::InvalidArg { .. } => error(StatusCode::BAD_REQUEST, "22P02", &message, None, None),
+        BuildError::ReadOnlyFunction(_) => error(StatusCode::METHOD_NOT_ALLOWED, "25006", &message, None, None),
     }
 }
 
@@ -524,17 +651,53 @@ mod tests {
     #[test]
     fn auth_errors() {
         let auth = Arc::new(Auth::new(&crate::config::Auth::default(), "0123456789abcdef0123456789abcdef", "http://x"));
-        let caller = |anon| Caller { grant: Grant::default(), anon, service: false, auth: auth.clone() };
+        let caller = |anon| Caller { grant: Grant::default(), role: "anon", anon, service: false, auth: auth.clone() };
         let denied = || BuildError::PermissionDenied("t".into());
         assert_eq!(caller(true).build_error(denied()).status(), StatusCode::UNAUTHORIZED);
         assert_eq!(caller(false).build_error(denied()).status(), StatusCode::FORBIDDEN);
         assert_eq!(caller(true).build_error(BuildError::RowPolicy("t".into())).status(), StatusCode::UNAUTHORIZED);
         assert_eq!(caller(true).build_error(BuildError::MissingFilter("DELETE")).status(), StatusCode::BAD_REQUEST);
+        let fn_denied = || BuildError::FunctionDenied("f".into());
+        assert_eq!(caller(true).build_error(fn_denied()).status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(caller(false).build_error(fn_denied()).status(), StatusCode::FORBIDDEN);
         for e in [RoleError::Missing, RoleError::Invalid, RoleError::Expired] {
             let r = jwt_error(e);
             assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(r.headers()[header::WWW_AUTHENTICATE], "Bearer");
         }
+    }
+
+    #[test]
+    fn rpc_errors_and_responses() {
+        let code = |e: BuildError| {
+            let r = build_error(e);
+            (r.status(), r.headers()[header::CONTENT_TYPE].clone())
+        };
+        let not_found = BuildError::FunctionNotFound { name: "f".into(), args: vec![], signature: Some("f(q)".into()) };
+        assert_eq!(code(not_found).0, StatusCode::NOT_FOUND);
+        assert_eq!(code(BuildError::InvalidArg { ty: "integer", value: "x".into() }).0, StatusCode::BAD_REQUEST);
+        assert_eq!(code(BuildError::ReadOnlyFunction("f".into())).0, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            code(BuildError::ReadOnlyView { verb: "update", view: "v".into() }).0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let r = call_response(Some("[1]".into()), 1, true, false, Returns::Setof);
+        assert_eq!(status_and_range(&r), (StatusCode::OK, "0-0/1"));
+        let r = call_response(Some(r#"[{"a":1}]"#.into()), 1, false, true, Returns::Setof);
+        assert_eq!(
+            (r.status(), &r.headers()[header::CONTENT_TYPE]),
+            (StatusCode::OK, &HeaderValue::from_static(OBJECT))
+        );
+        assert_eq!(
+            call_response(Some("[]".into()), 0, false, true, Returns::Setof).status(),
+            StatusCode::NOT_ACCEPTABLE
+        );
+        assert_eq!(call_response(Some("3".into()), 1, false, true, Returns::Value).status(), StatusCode::OK);
+        assert_eq!(
+            status_and_range(&call_response(None, 2, false, false, Returns::Void)),
+            (StatusCode::NO_CONTENT, "0-1/*")
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod db;
 mod jwt;
 mod openapi;
 mod query;
+mod rpc;
 mod schema;
 mod server;
 mod sql;
@@ -31,7 +32,7 @@ fn main() -> ExitCode {
         Command::Serve(config) => return serve(&config),
         Command::User { db_path, action, auth } => cli::user(&db_path, &action, &auth),
         Command::Keys(auth) => cli::keys(&auth),
-        Command::GenTypes(db_path) => cli::gen_types(&db_path),
+        Command::GenTypes { db_path, functions } => cli::gen_types(&db_path, functions.as_deref()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -43,12 +44,22 @@ fn main() -> ExitCode {
 }
 
 fn serve(config: &Config) -> ExitCode {
-    let created = rusqlite::Connection::open_with_flags(&config.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .and_then(|c| auth::ensure_tables(&c));
-    if let Err(e) = created {
-        eprintln!("rulite: cannot create the auth tables in {}: {e}", config.db_path.display());
-        return ExitCode::FAILURE;
-    }
+    let conn = rusqlite::Connection::open_with_flags(&config.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE);
+    let conn = match conn.and_then(|c| auth::ensure_tables(&c).map(|_| c)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rulite: cannot create the auth tables in {}: {e}", config.db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let functions = match functions(config, &conn) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rulite: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(conn);
 
     let (db, threads) = match db::open(&config.db_path, config.readers) {
         Ok(v) => v,
@@ -63,7 +74,7 @@ fn serve(config: &Config) -> ExitCode {
     // The TLS handshake timeout.
     #[cfg(feature = "tls")]
     runtime.enable_time();
-    let result = runtime.build().and_then(|rt| rt.block_on(server::run(config, db)));
+    let result = runtime.build().and_then(|rt| rt.block_on(server::run(config, db, functions)));
 
     // The server (and with it the last `Db` handle) is gone: DB threads drain and exit.
     threads.join();
@@ -74,4 +85,14 @@ fn serve(config: &Config) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The config's function files, checked against the database and the `rpc` grants.
+fn functions(config: &Config, conn: &rusqlite::Connection) -> Result<rpc::Functions, String> {
+    let functions = match &config.functions {
+        Some(dir) => rpc::check(conn, rpc::load(dir)?)?,
+        None => rpc::Functions::default(),
+    };
+    config.auth.access.check_functions(|name| functions.get(name).is_some())?;
+    Ok(functions)
 }

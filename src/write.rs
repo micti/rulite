@@ -200,6 +200,14 @@ fn run(
 ) -> std::result::Result<Output, Error> {
     let table = sql::find_table(schema, &w.table)?;
     let owner = grant.owner(table, Perm::Write)?;
+    if table.view {
+        let verb = match w.action {
+            Action::Insert(_) => "insert into",
+            Action::Update(_) => "update",
+            Action::Delete => "delete from",
+        };
+        return Err(BuildError::ReadOnlyView { verb, view: table.name.clone() }.into());
+    }
     let represent = w.prefer.return_ == Some(Return::Representation);
     // Owner tables always return keys: the written rows are checked.
     let keyed = represent || owner.is_some();
@@ -877,7 +885,7 @@ mod tests {
             ("tag".to_string(), Rule { perm: Perm::Read, ..Rule::default() }),
             ("todo".to_string(), owner("user_id", false)),
         ];
-        Grant { policy: Some(Arc::new(Policy { tables, default: Rule::default() })), uid: Some(uid.into()) }
+        Grant { policy: Some(Arc::new(Policy { tables, ..Policy::default() })), uid: Some(uid.into()) }
     }
 
     /// Runs one write as `grant`; `Ok(None)` for `return=minimal`.
@@ -1069,5 +1077,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.sql, b.sql);
+    }
+
+    #[test]
+    fn views_are_read_only() {
+        let mut c = novel();
+        let refused = |verb| Err(BuildError::ReadOnlyView { verb, view: "novel_stats".into() });
+        assert_eq!(insert(&mut c, "novel_stats", "", "", json!({ "title": "x" })), refused("insert into"));
+        assert_eq!(update(&mut c, "novel_stats", "title=eq.x", "", json!({ "title": "y" })), refused("update"));
+        assert_eq!(delete(&mut c, "novel_stats", "title=eq.x", ""), refused("delete from"));
+        assert_eq!(
+            BuildError::ReadOnlyView { verb: "insert into", view: "v".into() }.to_string(),
+            "cannot insert into view \"v\""
+        );
     }
 }

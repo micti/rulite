@@ -6,5 +6,10 @@
     "list":    { "authenticated": "write", "owner": "owner_id" },
     "todo":    { "authenticated": "write", "owner": "user_id" },
     "comment": { "anon": "read", "authenticated": "write", "owner": "author_id", "owner_scope": "write" }
+  },
+  "functions": "functions/todo",
+  "rpc": {
+    "*":      { "authenticated": "execute" },
+    "whoami": { "anon": "execute" }
   }
 }
