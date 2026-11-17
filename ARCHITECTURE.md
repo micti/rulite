@@ -1,11 +1,12 @@
-# Rulite — Architecture (end of phase 3)
+# Rulite — Architecture (end of phase 4)
 
-Recap of what phase 1 (M0–M6), phase 2 (M7–M12: auth, roles, table permissions, owner rows) and
-phase 3 (M13–M19: auth always on, TypeScript types, CORS, TLS) in [PLAN.md](PLAN.md) built, how it fits
+Recap of what phase 1 (M0–M6), phase 2 (M7–M12: auth, roles, table permissions, owner rows),
+phase 3 (M13–M19: auth always on, TypeScript types, CORS, TLS) and phase 4 (M20–M25: views, functions
+from SQL files) in [PLAN.md](PLAN.md) built, how it fits
 together, and the rules to keep when extending it. Audience: developers and AI coding agents. User-facing auth behaviour: [AUTH.md](AUTH.md).
 
-Rulite serves a PostgREST/Supabase-compatible REST API (`/rest/v1/{table}`) generated from any
-SQLite file, so `@supabase/supabase-js` works against it unchanged. The guiding constraint is the
+Rulite serves a PostgREST/Supabase-compatible REST API (`/rest/v1/{table}`, `/rest/v1/rpc/{function}`)
+generated from any SQLite file and a folder of function files, so `@supabase/supabase-js` works against it unchanged. The guiding constraint is the
 [Design rule](README.md#design-rule): **minimal resource footprint**. Measured: 3.0 MB binary (3.8 MB with
 `--features tls`), 4.2 MB idle RSS, ~13k req/s on a 5-level nested query with a JWT per request (see
 [README › Budget](README.md#budget)).
@@ -32,20 +33,24 @@ SQLite file, so `@supabase/supabase-js` works against it unchanged. The guiding 
 
 ```
 src/
-  main.rs      entry: Command → serve (auth tables → db::open → current_thread runtime → server::run)
+  main.rs      entry: Command → serve (auth tables → functions loaded + checked → db::open →
+               current_thread runtime → server::run)
                | user | keys | gen types
   config.rs    subcommands; CLI args > env vars (RULITE_*) > JSON config file > defaults; validation;
-               serving needs a jwt_secret; CORS origins and TLS paths (relative to the config file)
-  access.rs    config `tables` → one Policy per role (anon, authenticated); warnings vs. the schema
+               serving needs a jwt_secret; CORS origins, TLS paths and the functions folder (relative
+               to the config file)
+  access.rs    config `tables` + `rpc` → one Policy per role (anon, authenticated); warnings vs. the schema
   jwt.rs       HS256 sign/verify, base64url, API keys, refresh tokens, UUIDs
   auth.rs      auth_* tables, sessions + refresh rotation, /auth/v1 routes, Role from headers → Grant
   cli.rs       `rulite user add|passwd|delete|list`, `rulite keys`, `rulite gen types` (read-only connection)
   db.rs        DB threads (1 writer + 1–2 readers), job channels, Db::read / Db::write
-  schema.rs    introspection → Schema (tables, columns, uniques, FKs, relationships); SchemaCache
+  schema.rs    introspection → Schema (tables and views, columns, uniques, FKs, relationships); SchemaCache
   query.rs     PURE parser: query string + Prefer/Range/Accept headers → Query AST, Headers
   sql.rs       read SQL builder: (Schema, Query, Grant) → one Statement; Builder shared with writes;
                Grant / Policy / Rule / Perm (plain data, so the fuzz crate can build it)
   write.rs     write SQL builder + executor: INSERT / upsert / UPDATE / DELETE in one transaction
+  rpc.rs       function files: header parser, startup check (query | procedure), argument conversion,
+               query run through sql::build_call / build_scalar, procedure run on the writer
   openapi.rs   OpenAPI 3 document from Schema (hand-written serde_json)
   typescript.rs  `supabase gen types typescript` output from Schema (fmt::Write)
   cors.rs      CORS middleware; the header logic is a pure function (`decide`)
@@ -58,7 +63,7 @@ sample/        novel / event / todo: .sql (dev schemas), .json (configs, one jwt
                .types.ts (golden TypeScript types), built .db files
 ```
 
-Approximate size: ~7.7k lines of Rust (incl. 115 unit tests, 113 without `tls`), ~1.5k lines of JS / TS tests (115 cases).
+Approximate size: ~9.5k lines of Rust (incl. 130 unit tests, 128 without `tls`), ~1.7k lines of JS / TS tests (126 cases).
 
 ## 3. Runtime architecture
 
@@ -153,6 +158,31 @@ DB job. `service_role` gets `Grant::default()` (no policy: nothing is checked).
 5. Build errors and single-object mismatches roll the transaction back.
    Status: insert `201`, others `200` with body or `204` without.
 
+### Functions — `GET|POST /rest/v1/rpc/{name}`
+
+1. At startup `rpc::load` reads `<functions>/*.sql` and parses the header (`@param name type [= default]`,
+   `@returns setof|row|value|json|void`); `rpc::check` prepares each file with `rusqlite::Batch`: named
+   parameters only, each declared or reserved (`auth_uid`, `auth_role`), each declared one used. One
+   read-only statement is a **query**; anything that writes is a **procedure**. `Access::check_functions`
+   refuses `rpc` grants naming no function.
+2. The handler checks the role, the function's existence (`404 PGRST202`) and `Grant::execute`. Arguments
+   come from the JSON body (`POST`) or, on `GET` / `HEAD`, from the query-string pairs whose key is an
+   argument (`query::split_args`); the other pairs go to `parse_query`. `rpc::args` converts them to the
+   declared types (`22P02`), fills defaults and appends `:auth_uid` / `:auth_role`.
+3. **Query** (on a reader): the function's SQL becomes a CTE whose named parameters take `?1..?k` (they come
+   first in the text), and the request's filters / order / paging continue at `?k+1`:
+   ```sql
+   WITH "rulite rpc" AS (
+   <file SQL>
+   ) SELECT json_group_array(json(j)), count(*), <total> FROM (SELECT json_object(...) AS j FROM "rulite rpc" AS t0 WHERE ...)
+   ```
+   The result columns are a synthetic `Table` (re-read when the schema version moves), so `Builder`
+   resolves names and binds values as for a table; embeds find no relationship (`PGRST200`). `value` / `json`
+   use `build_scalar` (first column of the first row, `json_quote` / `json`).
+4. **Procedure** (on the writer): one `IMMEDIATE` transaction runs every statement, binding the parameters by
+   name; the last statement's rows become the body. This is the one place JSON is built in Rust
+   (`RETURNING` can't be a subquery). `GET` answers `405 25006`; filters `400`.
+
 ### Auth — `/auth/v1`
 
 Every route first checks that `apikey` is a valid anon / service_role key. Sign-in reads the user on a
@@ -169,7 +199,8 @@ and logout are writer transactions too. Access-token claims and the user object 
 - `introspect` reads everything in one read transaction via `pragma_table_list`, `pragma_table_info`,
   `pragma_index_list`/`_info` (full, non-partial unique indexes), `pragma_foreign_key_list`.
   Only `type = 'table'` in `main`, skipping `sqlite_*` and the auth tables (`auth_users`,
-  `auth_sessions`, `auth_refresh_tokens`); FKs to them are dropped — **views are not exposed yet**.
+  `auth_sessions`, `auth_refresh_tokens`); FKs to them are dropped. Views (`type = 'view'`) are tables
+  with `view: true`, no keys and no relationships; `write::execute` refuses them (`405 55000`).
 - `Column.json` is true for declared `JSON`/`JSONB` or a `CHECK (json_valid(col))` in the `CREATE TABLE` text.
 - `Affinity::from_decl_type` follows SQLite's affinity rules.
 - `derive_relationships`: each FK yields a `ManyToOne` (child → parent) and a `OneToMany`
@@ -200,6 +231,8 @@ and logout are writer transactions too. Access-token claims and the user object 
   `!inner` adds `EXISTS (...)` to the parent's `WHERE`.
 - Type mapping (`column_value`): INTEGER/REAL → number, TEXT → string, NULL → null,
   JSON columns via `json()`, BLOB → `\x` hex string (PostgreSQL `bytea` style). Writes invert this.
+- A column without a declared type (an expression in a view or a function result) has no affinity, so a
+  comparison value that parses as a number is bound as one (`filter_value`); typed columns get text.
 - `like` → `GLOB` (case-sensitive, as PostgreSQL), `ilike` → SQLite `LIKE`. Null ordering defaults
   to PostgreSQL's (last on ASC, first on DESC).
 - `count=exact` adds `(SELECT count(*) FROM ... WHERE ...)` to the **same** statement, reusing params.
@@ -226,7 +259,8 @@ and logout are writer transactions too. Access-token claims and the user object 
 ### server.rs — HTTP & errors
 
 Routes: `GET /rest/v1[/]` → OpenAPI; `GET /pg/generators/typescript` → TypeScript types (the postgres-meta
-route); `GET|POST|PATCH|DELETE /rest/v1/{table}`; `/auth/v1/*` (auth.rs); anything else → `404 PGRST125`.
+route); `GET|POST|PATCH|DELETE /rest/v1/{table}`; `GET|HEAD|POST /rest/v1/rpc/{name}`; `/auth/v1/*` (auth.rs);
+anything else → `404 PGRST125`.
 Both schema documents go through `schema_document`: `service_role` only, built on a reader and cached.
 Error body is always PostgREST's `{code, message, details, hint}`.
 
@@ -247,14 +281,19 @@ Error body is always PostgREST's `{code, message, details, hint}`.
 | NOT NULL / CHECK / STRICT type | 400 | `23502` / `23514` / `22P02` |
 | Busy / locked | 503 | `55P03` |
 | No key / bad token / expired token | 401 | `PGRST302` / `PGRST301` / `PGRST303` |
-| Role lacks the permission; owner set to another user | 401 (anon) / 403 | `42501` |
+| Role lacks the permission; owner set to another user; function not granted | 401 (anon) / 403 | `42501` |
+| Write on a view | 405 | `55000` |
+| Unknown function, or arguments it doesn't take | 404 | `PGRST202` |
+| Argument of the wrong type | 400 | `22P02` |
+| `GET` on a function that writes | 405 | `25006` |
 | DB thread gone | 503 | `PGRST000` |
 | Anything else | 500 | `XX000` |
 
 ### openapi.rs / typescript.rs
 
-Built on demand from the `Schema`, cached in `App.openapi` / `App.typescript` as `(schema_version, Bytes)`
-and rebuilt only when the version moves. Both share `Table::nullable` / `Table::required` (schema.rs): a
+Built on demand from the `Schema` and the functions, cached in `App.openapi` / `App.typescript` as
+`(schema_version, Bytes)` and rebuilt only when the version moves. Views get a GET path / `Row` only; functions
+a `/rpc/<name>` path / `Args` + `Returns` (result columns typed from their declared types at startup). Both share `Table::nullable` / `Table::required` (schema.rs): a
 STRICT or WITHOUT ROWID primary key and the rowid alias are never null; a column is required on insert when
 not nullable, without default and not the rowid alias. `typescript.rs` follows the Supabase CLI layout
 (tables and columns sorted by name, one `Relationships` entry per FK named `<table>_<cols>_fkey`,
@@ -273,6 +312,8 @@ reach `accept()` through a bounded channel. Routes and graceful shutdown are unc
 1. **No request identifier reaches SQL verbatim.** Every table/column/relationship is looked up in
    `Schema`, and SQL is written with the *schema's* name via `ident()` / `literal()`. Request values,
    aliases, limits and offsets are always bound `?N` params. The `build_read` fuzz target asserts this.
+   Function SQL comes from the server's files, chosen by a name looked up in `Functions`; its arguments
+   are always bound.
 2. **Equal query shapes → identical SQL text**, so `prepare_cached` hits. Never inline values into SQL.
    (Note: rusqlite's default statement-cache capacity is 16 per connection; not tuned yet.)
 3. **One statement per read**, JSON assembled by SQLite; no serde on the read hot path.
@@ -288,7 +329,9 @@ reach `accept()` through a bounded channel. Routes and graceful shutdown are unc
 10. **Access is checked in the builders, from a `Grant`.** Every table a statement touches goes through
     `Grant::owner` / `Builder::access`; the uid is a bound parameter; no SQL text comes from the config
     (owner columns are emitted with the schema's name). Auth is always on: no server runs without a
-    JWT secret, and a table nobody granted is closed to `anon` and `authenticated`.
+    JWT secret, and a table nobody granted is closed to `anon` and `authenticated`. Functions are the one
+    exception, by design: `Grant::execute` decides who may call one, then its SQL runs with full access
+    (`SECURITY DEFINER`), seeing the caller only through the bound `:auth_uid` / `:auth_role`.
 11. **The default build stays lean.** TLS crates live behind the `tls` feature only; check binary size
     with and without it (`tests/bench.sh`).
 
@@ -297,7 +340,7 @@ reach `accept()` through a bounded channel. Routes and graceful shutdown are unc
 | Layer | Command | What it covers |
 |---|---|---|
 | Unit (Rust) | `cargo test` (`--features tls` adds PEM loading) | config (CORS / TLS options too), parser, SQL builder, grants / owner rows, writes, schema/relationships, JWT, sessions / refresh, error mapping, status codes, TypeScript types (+ golden files), CORS headers |
-| Integration | `cargo build --release && cd tests && npm install && npm test` | `run.mjs` rebuilds `novel.db`/`event.db`/`todo.db` from `.sql` in a temp dir, adds users with `rulite user add`, starts one release binary per DB on a free port with its `sample/<name>.json` (novel with `--cors-origins`), runs `*.test.mjs`; `types.test.mjs` runs `tsc --noEmit` on `tests/types/usage.ts`; `tls.test.mjs` needs `cargo build --release --features tls --target-dir target/tls` (skipped otherwise) |
+| Integration | `cargo build --release && cd tests && npm install && npm test` | `rpc.test.mjs` views and functions; `run.mjs` rebuilds `novel.db`/`event.db`/`todo.db` from `.sql` in a temp dir, adds users with `rulite user add`, starts one release binary per DB on a free port with its `sample/<name>.json` (novel with `--cors-origins`), runs `*.test.mjs`; `types.test.mjs` runs `tsc --noEmit` on `tests/types/usage.ts`; `tls.test.mjs` needs `cargo build --release --features tls --target-dir target/tls` (skipped otherwise) |
 | Fuzz | `cd fuzz && cargo +nightly fuzz run -a parse ...` / `build_read ...` | Parser never panics; built SQL only names schema identifiers under random grants, binds the uid, and SQLite prepares it |
 | Budget | `tests/bench.sh [seconds] [readers] [auth\|tls]` | Binary size (with and without `tls`), idle/peak RSS, req/s, p50/p99 with `oha`; anon key per request, `auth` a user token, `tls` over HTTPS |
 
@@ -311,17 +354,19 @@ in `tests/*.test.mjs`, add fuzz seeds/dict tokens if new syntax, re-run the benc
 ## 8. Known gaps & candidates
 
 Out of scope so far (PLAN): realtime (`update_hook`, planned behind an off-by-default Cargo
-feature), RPC / views-as-functions, storage, admin UI, multi-database; for auth: sign-up, magic link,
+feature), storage, admin UI, multi-database; for functions: embedding from results and views, writable
+views, `Prefer: params=single-object`, array arguments in `GET`, raising errors, reloading files; for auth: sign-up, magic link,
 OTP, OAuth, MFA, policy SQL, column grants, asymmetric keys, config hot reload.
 
 Gaps noticed in the current code:
 
-- **Views** are not introspected (open question in PLAN: expose read-only?).
 - Bind defaults to `127.0.0.1:3000`; a non-loopback bind without TLS logs a warning to put an HTTPS proxy
   in front. Built-in TLS has no certificate reload (restart after renewal), no ACME, no HTTP/2.
 - `count=planned|estimated` = exact; `return=headers-only` behaves like `minimal`.
 - No request body size limit beyond axum's default; no request timeout.
-- Statement cache capacity is rusqlite's default (16) — may thrash with many query shapes.
+- Statement cache capacity is rusqlite's default (16) — may thrash with many query shapes (each function
+  query shape takes a slot too; procedures are prepared per call, uncached).
+- Function result columns that are expressions (`count(*)`) have no declared type: `unknown` in the types.
 - `schema_version` is checked per job — DDL from another process is picked up, but a long-running
   read keeps its old snapshot until the next job.
 - Embedded arrays get no default limit, only `--max-limit`.
@@ -333,5 +378,3 @@ Where later features would plug in:
 | Feature | Likely touch points |
 |---|---|
 | Realtime | `db.rs` writer thread (`update_hook`), new bounded broadcast channel, new route; Cargo feature |
-| Views | `schema.rs` introspect (`type = 'view'`, read-only flag), `write.rs` refuse, `openapi.rs` |
-| RPC | new route + module; reuse `Builder` params and error mapping |

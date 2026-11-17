@@ -55,9 +55,25 @@ GET    /rest/v1/                           -> OpenAPI document
 - [x] **M19 Quality:** CORS / TLS unit tests, `cors.test.mjs`, `tls.test.mjs` with a self-signed test cert,
   bench with and without `tls`, README "Deploy".
 
+## Phase 4 — Views & functions (done)
+
+- [x] **M20 Views:** SQLite views served read-only like tables (filters, order, count); writes answer `405`.
+- [x] **M21 Function files:** `functions` folder in the config; one `.sql` file per function with
+  `-- @param name type [= default]` and `-- @returns setof|row|value|json|void`; checked at startup.
+- [x] **M22 RPC queries:** `GET|POST /rest/v1/rpc/{name}`; a read-only function is a CTE in one statement on
+  a reader, so its result takes `select`, filters, `order`, paging, `count` and single-object mode.
+- [x] **M23 RPC procedures:** functions that write run all their statements in one `IMMEDIATE` transaction on
+  the writer and return the last statement's rows.
+- [x] **M24 Grants:** `rpc` in the config (`execute | none` per role, `"*"`); `:auth_uid` / `:auth_role`.
+- [x] **M25 Quality:** `Views` / `Functions` in the TypeScript types and OpenAPI, sample functions,
+  `rpc.test.mjs`, typed `rpc()` in `tests/types/usage.ts`.
+
 ## Not planned yet
 
-- Realtime (`update_hook`), RPC, storage, admin UI, multiple databases.
+- Realtime (`update_hook`), storage, admin UI, multiple databases.
+- Functions: embedding from function results and views, writable views (`INSTEAD OF` triggers),
+  `Prefer: params=single-object`, array arguments in `GET`, raising custom errors, reloading files, typed
+  expression columns.
 - Auth: sign-up, magic link, OTP, OAuth, MFA, policy SQL, column grants, asymmetric keys.
 - Types: `CHECK (col IN (…))` as a string-literal union (Supabase only does that for real enums).
 - TLS: ACME / Let's Encrypt, certificate reload, HTTP/2, client certificates (use a proxy).
