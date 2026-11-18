@@ -11,9 +11,40 @@ export const metadata: Metadata = { title: 'Install' }
 export default function Page() {
   return (
     <>
-      <PageHeader title="Install" lead="Rulite is a single Rust binary. Build it with Cargo; SQLite is bundled, so nothing else is needed at runtime." />
+      <PageHeader title="Install" lead="Rulite is a single binary with SQLite bundled, so nothing else is needed at runtime. Download a release or build it with Cargo." />
 
-      <H2 id="requirements">Requirements</H2>
+      <H2 id="binary">Download a binary</H2>
+      <P>
+        Each <A href="https://github.com/micti/rulite/releases">release</A> has prebuilt binaries for Linux (x86-64,
+        arm64) and macOS (Apple silicon), each also as a <Code>-tls</Code> variant with built-in HTTPS:
+      </P>
+      <Tabs defaultValue="linux-x64" className="my-4">
+        <TabsList>
+          <TabsTrigger value="linux-x64">Linux x86-64</TabsTrigger>
+          <TabsTrigger value="linux-arm64">Linux arm64</TabsTrigger>
+          <TabsTrigger value="macos">macOS</TabsTrigger>
+        </TabsList>
+        {[
+          ['linux-x64', 'x86_64-unknown-linux-gnu'],
+          ['linux-arm64', 'aarch64-unknown-linux-gnu'],
+          ['macos', 'aarch64-apple-darwin'],
+        ].map(([value, target]) => (
+          <TabsContent key={value} value={value}>
+            <CodeBlock
+              code={`
+curl -fsSL https://github.com/micti/rulite/releases/latest/download/rulite-${target}.tar.gz | tar -xz
+sudo mv rulite-${target}/rulite /usr/local/bin/
+`}
+            />
+          </TabsContent>
+        ))}
+      </Tabs>
+      <P>
+        Each archive has a <Code>.sha256</Code> file next to it for checking the download. For other platforms, install
+        with Cargo.
+      </P>
+
+      <H2 id="requirements">Requirements to build</H2>
       <Ul>
         <li>
           Rust <strong>1.91</strong> or newer (edition 2024), from <A href="https://rustup.rs">rustup.rs</A>.

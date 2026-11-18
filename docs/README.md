@@ -8,5 +8,7 @@ npm run dev      # http://localhost:3000
 npm run build    # static site in out/
 ```
 
-Set `DOCS_BASE_PATH=/rulite` when the site is served from a sub-path (e.g. GitHub Pages).
+Deployed to GitHub Pages by `.github/workflows/docs.yml` on every push to `main` that touches `docs/`; it sets
+`DOCS_BASE_PATH` (e.g. `/rulite`) from the Pages settings. Build locally with the same base path to preview it:
+`DOCS_BASE_PATH=/rulite npm run build`.
 Pages live in `app/` (`page.tsx`, `install/`, `usage/`); the sidebar is `lib/nav.ts`.
