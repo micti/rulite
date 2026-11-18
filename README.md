@@ -13,6 +13,8 @@ A Supabase-compatible REST API for any SQLite database, written in Rust.
   `from()`, `select()` with embeds, `insert()`, `update()` and `rpc()`
 - CORS for browser apps on other origins; optional built-in HTTPS (`--features tls`)
 
+**Docs: <https://micti.github.io/rulite/>** (source in [`docs/`](docs)).
+
 See [PLAN.md](PLAN.md) for the plan, [AUTH.md](AUTH.md) for auth & permissions and [ARCHITECTURE.md](ARCHITECTURE.md) for how it is built.
 
 ## Design rule
